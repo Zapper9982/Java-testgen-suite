@@ -1,0 +1,5 @@
+chromadb
+pyyaml
+transformers
+torch
+xmltodict  
