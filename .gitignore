@@ -1,3 +1,6 @@
 /venv/
 /processed_output/
 /chunked_output/
+.env
+/newest/
+/testgen-automation/     

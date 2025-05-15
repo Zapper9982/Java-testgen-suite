@@ -1,15 +1,26 @@
-import yaml
-from chromadb import Client
+# testgen-automation/src/chroma_db/chroma_client.py
+"""
+ChromaDB Client Setup (v0.4+)
+Using PersistentClient for on-disk persistence.
+"""
+from chromadb import PersistentClient
 
-class ChromaClient:
-    def __init__(self):
-        cfg = yaml.safe_load(open('config/chroma_config.yaml'))
-        self.client = Client(path=cfg['db_path'])
-        self.col = self.client.get_or_create_collection(cfg['collection_name'])
+# Change this path as needed (will be created if missing)
+PERSIST_DIRECTORY = "testgen-automation/data/chroma_db"
 
-    def add(self, ids, embeddings, metadatas, documents):
-        self.col.add(ids=ids, embeddings=embeddings, metadatas=metadatas, documents=documents)
+# No Settings import needed for new PersistentClient
 
-    def query(self, query_emb, n_results=5):
-        res = self.col.query(query_embeddings=[query_emb], n_results=n_results)
-        return res
+def get_chroma_client():
+    """Return a persistent ChromaDB client instance."""
+    # Initialize a PersistentClient pointing at PERSIST_DIRECTORY
+    return PersistentClient(path=PERSIST_DIRECTORY)
+
+
+def get_or_create_collection(client, name: str = "code_chunks"):
+    """
+    Retrieve an existing collection or create a new one.
+    """
+    return client.get_or_create_collection(
+        name=name,
+        metadata={"description": "SpringBoot code chunks"}
+    )
