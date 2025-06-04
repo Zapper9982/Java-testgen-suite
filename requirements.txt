@@ -11,3 +11,4 @@ requests>=2.28.0
 python-dotenv>=1.0.0
 langchain-text-splitters
 langchain-experimental
+langchain-huggingface

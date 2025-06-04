@@ -4,7 +4,8 @@ import yaml
 import json # Import json for serializing complex metadata
 from typing import List, Dict, Any
 from langchain_experimental.text_splitter import SemanticChunker
-from langchain_community.embeddings import HuggingFaceEmbeddings
+# from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain.docstore.document import Document
 
 try:
@@ -14,6 +15,11 @@ except ImportError:
     print("Warning: langchain RecursiveCharacterTextSplitter not found. Large semantic chunks will not be further split.")
     USE_LANGCHAIN_REC_SPLITTER = False
 
+# ----initialising Semantic Chunker module ---
+
+embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-small-en-v1.5")
+global_semantic_chunker = SemanticChunker(embeddings=embeddings)
+
 #CONFIG
 GENERIC_CHUNK_SIZE = 800
 GENERIC_CHUNK_OVERLAP = 100
@@ -21,9 +27,6 @@ GENERIC_CHUNK_OVERLAP = 100
 # --- File Loading Functions ---
 
 def _infer_file_type_from_content(filename_base: str, content: str) -> str:
-    """
-    Infers the original file type (java, config, or unknown) based on content and filename hints.
-    """
     # 1. Check for common config file names (even without full extension)
     # Added more robust checks for config file content signatures
     if (filename_base.lower() in ["application", "bootstrap"] and
@@ -35,7 +38,6 @@ def _infer_file_type_from_content(filename_base: str, content: str) -> str:
     if any(line.strip().startswith(key) and '=' in line for key in ["spring.", "server.", "my."] for line in content.splitlines() if line.strip() and not line.strip().startswith("#")):
         return 'config'
 
-
     # 2. Check for Java content
     # Look for common Java keywords and structures
     if (re.search(r"\b(package|import|class|interface|enum)\b", content) and
@@ -46,10 +48,6 @@ def _infer_file_type_from_content(filename_base: str, content: str) -> str:
     return 'unknown'
 
 def load_files_from_txt_directory(input_dir: str) -> List[Dict[str, str]]:
-    """
-    Loads all .txt files from a given directory and its subdirectories,
-    and infers the original file type based on content.
-    """
     loaded_files = []
     for root, _, files in os.walk(input_dir):
         for file in files:
@@ -59,7 +57,7 @@ def load_files_from_txt_directory(input_dir: str) -> List[Dict[str, str]]:
                     with open(path, "r", encoding="utf-8") as f:
                         content = f.read()
                         
-                        # Get the filename without the .txt extension
+                        # Get the filename without the .txt extension so as to write to the chunk metadata 
                         original_filename_base = os.path.splitext(file)[0]
 
                         inferred_type = _infer_file_type_from_content(original_filename_base, content)
@@ -74,7 +72,7 @@ def load_files_from_txt_directory(input_dir: str) -> List[Dict[str, str]]:
                     print(f"Error reading {path}: {e}")
     return loaded_files
 
-# --- Code Cleaning and Parsing Functions (remain mostly the same) ---
+# --- Code Cleaning and Parsing Functions (remain mostly the same)  ---
 def remove_comments_and_clean_code(code: str) -> str:
     code = re.sub(r"/\*.*?\*/", "", code, flags=re.DOTALL)
     code = re.sub(r"//.*", "", code)
@@ -191,12 +189,9 @@ def parse_config_file(content: str, filename_base: str) -> List[Dict[str, str]]:
     return config_chunks
 
 # --- Semantic Chunking Function ---
-def semantic_chunk_with_metadata(texts: List[str], metadatas: List[Dict[str, Any]]) -> List[Document]:
+def semantic_chunk_with_metadata(texts: List[str], metadatas: List[Dict[str, Any]],chunker: SemanticChunker) -> List[Document]:
     if len(texts) != len(metadatas):
         raise ValueError("Texts and metadatas lists must have the same length.")
-
-    embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-small-en-v1.5")
-    chunker = SemanticChunker(embeddings=embeddings) 
 
     # Pass texts and metadatas directly to create_documents
     semantically_chunked_docs = chunker.create_documents(texts, metadatas=metadatas)
@@ -206,10 +201,7 @@ def semantic_chunk_with_metadata(texts: List[str], metadatas: List[Dict[str, Any
 # --- Main Processing Function ---
 
 def process_codebase_from_txt_for_chunking(input_dir: str, output_json_path: str) -> List[Dict[str, Any]]:
-    """
-    Processes codebase content read from .txt files, inferring their type,
-    extracting rich chunks with metadata, and applies a generic character-based chunking.
-    """
+
     all_final_chunks: List[Dict[str, Any]] = []
 
     generic_splitter = None
@@ -277,7 +269,7 @@ def process_codebase_from_txt_for_chunking(input_dir: str, output_json_path: str
                 contents_for_semantic_chunking.append(method_content)
                 metadatas_for_semantic_chunking.append(method_metadata)
                 
-            semantically_chunked_docs = semantic_chunk_with_metadata(contents_for_semantic_chunking, metadatas_for_semantic_chunking)
+            semantically_chunked_docs = semantic_chunk_with_metadata(contents_for_semantic_chunking, metadatas_for_semantic_chunking,global_semantic_chunker)
             
             for doc in semantically_chunked_docs:
                 if generic_splitter and len(doc.page_content) > GENERIC_CHUNK_SIZE:
@@ -372,153 +364,12 @@ def process_codebase_from_txt_for_chunking(input_dir: str, output_json_path: str
     return all_final_chunks
 
 
-# --- Example Usage ---
+# --- Usage ---
 
-input_directory_for_this_script = 'processed_output'
-final_output_json_path = './chunked_output/intelligent_chunks_from_txt.json'
-
-# --- Create dummy processed_output with .txt files *without* .java suffix for testing ---
-# In your actual workflow, these would be generated by your first chunker.
-os.makedirs(os.path.join(input_directory_for_this_script, "com", "example", "app"), exist_ok=True)
-os.makedirs(os.path.join(input_directory_for_this_script, "config"), exist_ok=True)
-os.makedirs(os.path.join(input_directory_for_this_script, "com", "iemr", "tm", "service", "schedule"), exist_ok=True) # Ensure this path exists
-
-with open(os.path.join(input_directory_for_this_script, "com", "example", "app", "UserController.txt"), "w") as f:
-    f.write("""
-package com.example.app;
-
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.PostMapping;
-import org.springframework.web.bind.annotation.RequestBody;
-import org.springframework.web.bind.annotation.RequestParam;
-import org.springframework.web.bind.annotation.RestController;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.stereotype.Service;
-
-@RestController
-@RequestMapping("/api/users")
-public class UserController {
-
-    @Autowired
-    private UserService userService;
-
-    /**
-     * Retrieves a user by ID.
-     * @param id The user ID.
-     * @return The user object.
-     */
-    @GetMapping("/{id}")
-    public User getUserById(@RequestParam Long id) {
-        // Some logic here
-        return userService.findUser(id);
-    }
-
-    @PostMapping("/")
-    public User createUser(@RequestBody User user) {
-        // Another logic block
-        return userService.saveUser(user);
-    }
-
-    private void internalHelperMethod() {
-        System.out.println("This is an internal helper.");
-    }
-}
-""")
-
-with open(os.path.join(input_directory_for_this_script, "com", "example", "app", "UserService.txt"), "w") as f:
-    f.write("""
-package com.example.app;
-
-import org.springframework.stereotype.Service;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.transaction.annotation.Transactional;
-
-@Service
-public class UserService {
-
-    @Autowired
-    private UserRepository userRepository;
-
-    @Transactional
-    public User findUser(Long id) {
-        // Complex business logic to find a user
-        return userRepository.findById(id).orElse(null);
-    }
-
-    public User saveUser(User user) {
-        // Logic to save a user
-        return userRepository.save(user);
-    }
-}
-""")
-
-with open(os.path.join(input_directory_for_this_script, "config", "application.txt"), "w") as f: # Now just 'application.txt'
-    f.write("""
-spring.datasource.url=jdbc:h2:mem:testdb
-spring.datasource.driverClassName=org.h2.Driver
-spring.datasource.username=sa
-spring.datasource.password=password
-server.port=8080
-# This is a comment
-my.custom.property=someValue
-""")
-
-with open(os.path.join(input_directory_for_this_script, "config", "some-other-config.txt"), "w") as f:
-    f.write("""
-server:
-    port: 8081
-    servlet:
-        context-path: /app
-database:
-    type: postgres
-    host: localhost
-    port: 5432
-""")
-
-with open(os.path.join(input_directory_for_this_script, "README.txt"), "w") as f:
-    f.write("This is a readme file. It should be treated as unclassified text.")
-
-# Add dummy content for SchedulingServiceImpl.txt to match your previous errors
-with open(os.path.join(input_directory_for_this_script, "com", "iemr", "tm", "service", "schedule", "SchedulingServiceImpl.txt"), "w") as f:
-    f.write("""
-package com.iemr.tm.service.schedule;
-
-public class SchedulingServiceImpl {
-    public void scheduleTask1() {
-        // Task 1 details
-    }
-    public void scheduleTask2() {
-        // Task 2 details
-    }
-    public void scheduleTask3() {
-        // Task 3 details
-    }
-    public void scheduleTask4() {
-        // Task 4 details
-    }
-}
-""")
-# Add dummy content for application.properties.txt (if it was treated as a separate file)
-# Assuming 'application.properties.txt' is an alias for 'config/application.txt' if you had it.
-# If it's a separate file, create it. Otherwise, this part is redundant.
-if not os.path.exists(os.path.join(input_directory_for_this_script, "src", "main", "resources", "application.properties.txt")):
-    os.makedirs(os.path.join(input_directory_for_this_script, "src", "main", "resources"), exist_ok=True)
-    with open(os.path.join(input_directory_for_this_script, "src", "main", "resources", "application.properties.txt"), "w") as f:
-        f.write("some.property=value\nanother.property=another_value")
+input_dir = 'processed_output'
+output_json_path = './chunked_output/intelligent_chunks_from_txt.json'
 
 
-# Run the processing
-processed_chunks = process_codebase_from_txt_for_chunking(input_directory_for_this_script, final_output_json_path)
+# # Run the processing
+processed_chunks = process_codebase_from_txt_for_chunking(input_dir, output_json_path)
 
-# You can uncomment the following to print a few chunks
-# for i, chunk in enumerate(processed_chunks[:10]): # Print first 10 chunks for review
-#     print(f"\n--- Chunk {i+1} ---")
-#     print(f"Filename: {chunk['filename']}")
-#     print(f"Filepath (txt): {chunk['filepath_txt']}")
-#     print(f"Metadata: {chunk['chunk_metadata']}")
-#     print(f"Content:\n{chunk['chunk_content']}")
-#     print("-" * 30)
-
-# Optional: Clean up dummy files and directories after testing
-# import shutil
-# shutil.rmtree(input_directory_for_this_script)
