@@ -1,2 +1,0 @@
-db_path: "./.chroma-db"
-collection_name: "code_chunks"

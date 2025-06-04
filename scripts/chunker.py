@@ -7,7 +7,6 @@ from langchain_experimental.text_splitter import SemanticChunker
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain.docstore.document import Document
 
-# Import the RecursiveCharacterTextSplitter
 try:
     from langchain.text_splitter import RecursiveCharacterTextSplitter
     USE_LANGCHAIN_REC_SPLITTER = True
@@ -15,7 +14,7 @@ except ImportError:
     print("Warning: langchain RecursiveCharacterTextSplitter not found. Large semantic chunks will not be further split.")
     USE_LANGCHAIN_REC_SPLITTER = False
 
-# Configuration for RecursiveCharacterTextSplitter
+#CONFIG
 GENERIC_CHUNK_SIZE = 800
 GENERIC_CHUNK_OVERLAP = 100
 
@@ -61,13 +60,13 @@ def load_files_from_txt_directory(input_dir: str) -> List[Dict[str, str]]:
                         content = f.read()
                         
                         # Get the filename without the .txt extension
-                        original_filename_base = os.path.splitext(file)[0] # e.g., 'UserController' from 'UserController.txt'
+                        original_filename_base = os.path.splitext(file)[0]
 
                         inferred_type = _infer_file_type_from_content(original_filename_base, content)
 
                         loaded_files.append({
-                            "filepath": path, # The path to the .txt file
-                            "original_filename_base": original_filename_base, # e.g., 'UserController'
+                            "filepath": path,
+                            "original_filename_base": original_filename_base,
                             "content": content,
                             "inferred_type": inferred_type
                         })
@@ -83,7 +82,7 @@ def remove_comments_and_clean_code(code: str) -> str:
     return code
 
 def parse_java_code_with_metadata(code_content: str, filename_base: str) -> Dict[str, Any]:
-    # filename_base will now be like 'UserController'
+
     parsed_data: Dict[str, Any] = {
         "filename": f"{filename_base}.java", # Re-add .java for better metadata context if it's Java
         "class_name": "UnknownClass",
