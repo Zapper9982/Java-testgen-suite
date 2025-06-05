@@ -110,9 +110,9 @@ def parse_java_code_with_metadata(code_content: str, filename_base: str) -> Dict
         })
 
     method_pattern = re.compile(
-        r"(?:^@\w+\s*)*\s*(public|private|protected|static|final|abstract|synchronized|native|strictfp)?\s*(?:<[\w,\s]+>)?\s*([\w\.<>\[\]]+)\s+(\w+)\s*\(([^)]*)\)\s*(?:throws\s+[\w\.]+)?\s*\{",
-        re.MULTILINE
-    )
+    r"(?:^@\w+\s*)*\s*(public|private|protected|static|final|abstract|synchronized|native|strictfp)?\s*(?:<[\w,\s]+>)?\s*([\w\.<>\[\]]+)\s+(\w+)\s*\(([^)]*)\)\s*(?:throws\s+(?:[\w\.]+(?:,\s*[\w\.]+)*))?\s*\{",
+    re.MULTILINE
+     )
     method_matches = list(method_pattern.finditer(code_content))
     for i, match in enumerate(method_matches):
         method_start = match.start()
@@ -367,7 +367,7 @@ def process_codebase_from_txt_for_chunking(input_dir: str, output_json_path: str
 # --- Usage ---
 
 input_dir = 'processed_output'
-output_json_path = './chunked_output/intelligent_chunks_from_txt.json'
+output_json_path = './chunked_output/chunks.json'
 
 
 # # Run the processing
