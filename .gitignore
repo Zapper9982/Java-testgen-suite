@@ -4,3 +4,4 @@
 .env
 /newest/
 /chromadata/ 
+src/test/*
