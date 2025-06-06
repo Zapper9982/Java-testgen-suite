@@ -24,7 +24,7 @@ except ImportError:
 
 # ─── Configuration ─────────────────────────────────────────────────────────────
 # Updated to match the output filename from the last chunker script
-CHUNKS_JSON = PROJECT_ROOT / "chunked_output" / "intelligent_chunks_from_txt.json"
+CHUNKS_JSON = PROJECT_ROOT / "chunked_output" / "chunks.json"
 MODEL_NAME  = "BAAI/bge-small-en-v1.5" # Excellent choice for general-purpose embeddings
 DEVICE      = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -108,7 +108,8 @@ def main():
         return
 
     client     = get_chroma_client()
-    collection = get_or_create_collection(client)
+    # collection = get_or_create_collection(client)
+    collection = get_or_create_collection(client, name="code_chunks_collection")
 
     # Process chunks in batches (optional, but good for performance)
     batch_size = 32 # Adjust based on your GPU memory and model size

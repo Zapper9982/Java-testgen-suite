@@ -13,3 +13,6 @@ langchain-text-splitters
 langchain-experimental
 langchain-huggingface
 openai
+langchain-google-genai
+langchain-anthropic
+langchain-groq
