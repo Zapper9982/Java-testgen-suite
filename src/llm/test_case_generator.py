@@ -3,52 +3,39 @@ from pathlib import Path
 import os
 from typing import List, Dict, Any, Union
 
-# Define the root of the 'testgen-automation' project (where this script lives)
-# This is used for correctly importing internal modules like 'chroma_db'.
+#for proper project root 
 TESTGEN_AUTOMATION_ROOT = Path(__file__).parent.parent.parent
 
-# Define the root of your Spring Boot project.
-# This is the base path for where the generated test files will be saved.
+# TODO -- currently hardcoded
 SPRING_BOOT_PROJECT_ROOT = Path("/Users/tanmay/Desktop/AMRIT/BeneficiaryID-Generation-API")
 
-# Add the 'src' directory of the testgen-automation project to sys.path.
-# This ensures that imports like 'from chroma_db.chroma_client' work correctly.
+#adds src to system path
 TESTGEN_AUTOMATION_SRC_DIR = TESTGEN_AUTOMATION_ROOT / "src"
 if str(TESTGEN_AUTOMATION_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(TESTGEN_AUTOMATION_SRC_DIR))
     print(f"Added {TESTGEN_AUTOMATION_SRC_DIR} to sys.path for internal module imports.")
 
 
-# Import ChromaDB client functions (from your existing chroma_db module)
+#all imports 
 from chroma_db.chroma_client import get_chroma_client, get_or_create_collection
-
-# LangChain Imports - Updated to langchain_community
 from langchain_community.vectorstores import Chroma
 from langchain_community.embeddings import HuggingFaceBgeEmbeddings
-
-
-# --- Import for Groq ---
 from langchain_groq import ChatGroq
-# --- END NEW ---
-
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
-import torch # Still needed for embedding model device configuration
+import torch 
 
-# --- Configuration ---
-# NOW using Groq API configuration
 
-# Groq API Configuration
-GROQ_API_KEY = os.getenv("GROQ_API_KEY") # Recommended: Get from environment variable
+
+# Groq API Config
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 if not GROQ_API_KEY:
     print("WARNING: GROQ_API_KEY environment variable not set. Please set it for Groq API calls.")
-    print("Example: export GROQ_API_KEY='sk_your_groq_api_key_here'")
     
-# --- CHANGE HERE: Using a Llama 3 model from Groq ---
-LLM_MODEL_NAME_GROQ = "llama3-8b-8192" # Or "mixtral-8x7b-32768" for a larger model
+#llm model def
+LLM_MODEL_NAME_GROQ = "llama3-8b-8192" # Or " llama3-8b-8192 mixtral-8x7b-32768" for a larger model
 
-# Embedding Model (still BGE for local embeddings in ChromaDB)
-# This MUST match the model used when you ran src/embedder/embed_chunks.py
+#defining the embedding model and loading to CPU 
 EMBEDDING_MODEL_NAME_BGE = "BAAI/bge-small-en-v1.5"
 DEVICE_FOR_EMBEDDINGS = "cuda" if torch.cuda.is_available() else "cpu" 
 
@@ -105,7 +92,7 @@ class TestCaseGenerator:
     """
     def __init__(self, collection_name: str = "code_chunks_collection"):
         print("Initializing TestCaseGenerator with LangChain components (Groq LLM)...")
-        # 1. Initialize Embedding Model (for LangChain's Chroma client)
+        #  initializing  embedding Model 
         print(f"Loading embedding model: {EMBEDDING_MODEL_NAME_BGE} on {DEVICE_FOR_EMBEDDINGS}...")
         self.embeddings = HuggingFaceBgeEmbeddings(
             model_name=EMBEDDING_MODEL_NAME_BGE,
@@ -113,27 +100,27 @@ class TestCaseGenerator:
             encode_kwargs={'normalize_embeddings': True}
         )
         print("Embedding model loaded.")
-
-        # 2. Instantiate ChromaDB as LangChain Vectorstore
+          
+          # 2. instantiating chromadb vectorstore
         print(f"Connecting to ChromaDB collection: {collection_name}...")
         self.chroma_client = get_chroma_client()
         self.vectorstore = Chroma(
             client=self.chroma_client,
             collection_name=collection_name,
-            embedding_function=self.embeddings # Pass the embedding function
+            embedding_function=self.embeddings 
         )
-        # Initialize retriever without a specific filter initially
+         #initialising langchain retriever 
         self.retriever = self.vectorstore.as_retriever(
             search_type="mmr", 
-            search_kwargs={"k": 6}, # No "filter" here yet
+            search_kwargs={"k": 6},#TODO-- make it dynamic because number of methods in springboot class might vary.
         )
         print("ChromaDB retriever instantiated (without initial filter).")
 
-        # 3. Instantiate the LLM (Groq)
+        # calling the llm
         self.llm = self._instantiate_llm()
         print("Groq LLM instantiated for LangChain.")
 
-        # 4. Define the Prompt Template for RetrievalQA Chain
+        #the prompt or writing Junit test for QA retrieval chain.
         template = """
 As an expert Java developer and Spring Boot testing specialist, your task is to generate a comprehensive JUnit 5 test case.
 Include necessary imports, annotations, and test methods (e.g., @BeforeEach, @Test).
@@ -241,29 +228,17 @@ Here is the relevant code context from the project, retrieved from the vector da
             return f"Error during LLM generation with LangChain (Groq): {e}. " \
                    "Ensure your GROQ_API_KEY is correct and you have access to Groq API."
 
-# --- Main execution (for testing this module directly) ---
+# MAIN function 
 if __name__ == "__main__":
     try:
         test_generator = TestCaseGenerator(collection_name="code_chunks_collection") 
 
-        # Define the target files and their corresponding queries.
-        # The 'original_file_metadata_path' should be the exact value of the 'filepath_txt'
-        # metadata found in your chunks.json for the file you want to test.
-        # This allows dynamic path derivation.
         target_files_to_test = [
             {
                 "original_file_metadata_path": "processed_output/com/iemr/common/bengen/service/BengenService.txt",
-                "query_description": "Write comprehensive JUnit 5 test cases for the `BengenService.java` class, including all TODOs and assertions and make the necessary inputs, also to call functions from that .java file use the 'import com.iemr.common.bengen.service.BengenService;' this import please. Focus on unit tests for each public method. and write complete testcases"
+                "query_description": "I need comprehensive JUnit 5 test cases for the `BengenService.java` class. Please ensure tests are **deterministic**, utilize **Mockito** for mocking dependencies, and cover all public methods. **make sure to import BengenService.java using 'import com.iemr.common.bengen.service.BengenService;'**"
+
             },
-            # Add other files here as needed. Example:
-            # {
-            #     "original_file_metadata_path": "processed_output/com/iemr/common/bengen/config/quartz/ScheduleJobServiceForBenGen.txt",
-            #     "query_description": "Generate JUnit 5 tests for the ScheduleJobServiceForBenGen class, covering job execution and configuration loading."
-            # },
-            # {
-            #     "original_file_metadata_path": "processed_output/com/iemr/common/bengen/utils/CookieUtil.txt",
-            #     "query_description": "Generate JUnit 5 test cases for the CookieUtil.java utility class, focusing on its cookie parsing and JWT token extraction methods."
-            # }
         ]
 
         for target_info in target_files_to_test:

@@ -5,3 +5,4 @@
 /newest/
 /chromadata/ 
 src/test/*
+llm/__pycache__
