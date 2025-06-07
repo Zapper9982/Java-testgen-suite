@@ -3,39 +3,44 @@ from pathlib import Path
 import os
 from typing import List, Dict, Any, Union
 
-#for proper project root 
+# Define the root of the 'testgen-automation' project (where this script lives)
 TESTGEN_AUTOMATION_ROOT = Path(__file__).parent.parent.parent
 
-# TODO -- currently hardcoded
+# Define the root of your Spring Boot project.
 SPRING_BOOT_PROJECT_ROOT = Path("/Users/tanmay/Desktop/AMRIT/BeneficiaryID-Generation-API")
 
-#adds src to system path
+# Add the 'src' directory of the testgen-automation project to sys.path.
 TESTGEN_AUTOMATION_SRC_DIR = TESTGEN_AUTOMATION_ROOT / "src"
 if str(TESTGEN_AUTOMATION_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(TESTGEN_AUTOMATION_SRC_DIR))
     print(f"Added {TESTGEN_AUTOMATION_SRC_DIR} to sys.path for internal module imports.")
 
 
-#all imports 
+# All Imports
 from chroma_db.chroma_client import get_chroma_client, get_or_create_collection
 from langchain_community.vectorstores import Chroma
 from langchain_community.embeddings import HuggingFaceBgeEmbeddings
-from langchain_groq import ChatGroq
+# --- CHANGE START: Use Google's Generative AI for Gemini ---
+from langchain_google_genai import ChatGoogleGenerativeAI
+# --- CHANGE END ---
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 import torch 
 
 
+# --- Google API Configuration ---
+# Get Google API Key from environment variable
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") 
+if not GOOGLE_API_KEY:
+    print("WARNING: GOOGLE_API_KEY environment variable not set. Please set it for Gemini API calls.")
+    print("Example: export GOOGLE_API_KEY='your_google_api_key_here'")
 
-# Groq API Config
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-if not GROQ_API_KEY:
-    print("WARNING: GROQ_API_KEY environment variable not set. Please set it for Groq API calls.")
-    
-#llm model def
-LLM_MODEL_NAME_GROQ = "llama3-8b-8192" # Or " llama3-8b-8192 mixtral-8x7b-32768" for a larger model
+# LLM model definition - Using Gemini 1.5 Flash for potentially better rate limits and speed
+# You can change this to "gemini-pro" if you prefer, but be mindful of potential limits.
+LLM_MODEL_NAME_GEMINI = "gemini-1.5-flash" 
+# --- END Google API Configuration ---
 
-#defining the embedding model and loading to CPU 
+# Defining the embedding model and loading to CPU 
 EMBEDDING_MODEL_NAME_BGE = "BAAI/bge-small-en-v1.5"
 DEVICE_FOR_EMBEDDINGS = "cuda" if torch.cuda.is_available() else "cpu" 
 
@@ -88,11 +93,11 @@ def get_test_paths(original_filepath_txt: str, project_root: Path):
 class TestCaseGenerator:
     """
     Generates JUnit 5 test cases using a LangChain RetrievalQA chain
-    with a ChromaDB retriever and a Groq LLM.
+    with a ChromaDB retriever and a Google Gemini LLM.
     """
     def __init__(self, collection_name: str = "code_chunks_collection"):
-        print("Initializing TestCaseGenerator with LangChain components (Groq LLM)...")
-        #  initializing  embedding Model 
+        print("Initializing TestCaseGenerator with LangChain components (Google Gemini LLM)...")
+        # Initializing embedding Model 
         print(f"Loading embedding model: {EMBEDDING_MODEL_NAME_BGE} on {DEVICE_FOR_EMBEDDINGS}...")
         self.embeddings = HuggingFaceBgeEmbeddings(
             model_name=EMBEDDING_MODEL_NAME_BGE,
@@ -101,7 +106,7 @@ class TestCaseGenerator:
         )
         print("Embedding model loaded.")
           
-          # 2. instantiating chromadb vectorstore
+        # 2. Instantiating ChromaDB vectorstore
         print(f"Connecting to ChromaDB collection: {collection_name}...")
         self.chroma_client = get_chroma_client()
         self.vectorstore = Chroma(
@@ -109,23 +114,23 @@ class TestCaseGenerator:
             collection_name=collection_name,
             embedding_function=self.embeddings 
         )
-         #initialising langchain retriever 
+        # Initializing LangChain retriever 
         self.retriever = self.vectorstore.as_retriever(
             search_type="mmr", 
             search_kwargs={"k": 6},#TODO-- make it dynamic because number of methods in springboot class might vary.
         )
         print("ChromaDB retriever instantiated (without initial filter).")
 
-        # calling the llm
+        # Calling the LLM
         self.llm = self._instantiate_llm()
-        print("Groq LLM instantiated for LangChain.")
+        print("Google Gemini LLM instantiated for LangChain.")
 
-        #the prompt or writing Junit test for QA retrieval chain.
+        # The prompt for writing JUnit test for QA retrieval chain.
         template = """
-As an expert Java developer and Spring Boot testing specialist, your task is to generate a comprehensive JUnit 5 test case.
+As an expert Java developer and Spring Boot testing specialist, your task is to generate a comprehensive test cases.
 Include necessary imports, annotations, and test methods (e.g., @BeforeEach, @Test).
 Provide ONLY the Java code block. Do NOT include any conversational text, explanations, or extraneous characters outside the code block.
-
+"I need comprehensive test cases for the `BengenService.java` class. Please ensure tests are **deterministic** and cover all public methods. **make sure to import BengenService.java using 'import com.iemr.common.bengen.service.BengenService;' ensure that you use Assertions to validate void functions also i want 100% coverage on JaCoCo Reports so focus on that .also dont use DataTypeConverters 
 Here is the relevant code context from the project, retrieved from the vector database:
 
 ```java
@@ -145,14 +150,16 @@ Here is the relevant code context from the project, retrieved from the vector da
         )
         print("RetrievalQA Chain initialized.")
 
-    def _instantiate_llm(self) -> ChatGroq:
-        """Instantiates the Groq LLM for LangChain."""
-        if not GROQ_API_KEY:
-            raise ValueError("GROQ_API_KEY environment variable is not set. Cannot initialize Groq LLM.")
+    # --- CHANGE START: Use ChatGoogleGenerativeAI ---
+    def _instantiate_llm(self) -> ChatGoogleGenerativeAI:
+        """Instantiates the Google Gemini LLM for LangChain."""
+        if not GOOGLE_API_KEY:
+            raise ValueError("GOOGLE_API_KEY environment variable is not set. Cannot initialize Gemini LLM.")
         
-        print(f"Using Groq LLM: {LLM_MODEL_NAME_GROQ}...")
-        os.environ["GROQ_API_KEY"] = GROQ_API_KEY 
-        return ChatGroq(model_name=LLM_MODEL_NAME_GROQ, temperature=0.7)
+        # The API key is usually picked up automatically by the library if set as GOOGLE_API_KEY env var
+        print(f"Using Google Gemini LLM: {LLM_MODEL_NAME_GEMINI}...")
+        return ChatGoogleGenerativeAI(model=LLM_MODEL_NAME_GEMINI, temperature=0.7)
+    # --- CHANGE END ---
 
     def _update_retriever_filter(self, filename: str):
         """Updates the retriever's filter to target a specific filename."""
@@ -225,8 +232,8 @@ Here is the relevant code context from the project, retrieved from the vector da
             return generated_code
 
         except Exception as e:
-            return f"Error during LLM generation with LangChain (Groq): {e}. " \
-                   "Ensure your GROQ_API_KEY is correct and you have access to Groq API."
+            return f"Error during LLM generation with LangChain (Google Gemini): {e}. " \
+                   "Ensure your GOOGLE_API_KEY is correct and you have access to Google Generative AI API."
 
 # MAIN function 
 if __name__ == "__main__":
@@ -236,7 +243,7 @@ if __name__ == "__main__":
         target_files_to_test = [
             {
                 "original_file_metadata_path": "processed_output/com/iemr/common/bengen/service/BengenService.txt",
-                "query_description": "I need comprehensive JUnit 5 test cases for the `BengenService.java` class. Please ensure tests are **deterministic**, utilize **Mockito** for mocking dependencies, and cover all public methods. **make sure to import BengenService.java using 'import com.iemr.common.bengen.service.BengenService;'**"
+                "query_description": "I need comprehensive test cases for the `BengenService.java` class. Please ensure tests are **deterministic** and cover all public methods. **make sure to import BengenService.java using 'import com.iemr.common.bengen.service.BengenService;' ensure that you use Assertions to validate void functions also i want 100% coverage on JaCoCo Reports so focus on that ."
 
             },
         ]
@@ -281,7 +288,7 @@ if __name__ == "__main__":
             
     except ValueError as ve:
         print(f"Configuration Error: {ve}")
-        print("Please ensure GROQ_API_KEY is set and other configurations are correct.")
+        print("Please ensure GOOGLE_API_KEY is set and other configurations are correct.")
     except Exception as e:
         print(f"An unexpected error occurred during main execution: {e}")
-        print("Verify your ChromaDB setup and network connection for Groq API.")
+        print("Verify your ChromaDB setup and network connection for Google Generative AI API.")
