@@ -130,7 +130,7 @@ class TestCaseGenerator:
 As an expert Java developer and Spring Boot testing specialist, your task is to generate a comprehensive test cases.
 Include necessary imports, annotations, and test methods (e.g., @BeforeEach, @Test).
 Provide ONLY the Java code block. Do NOT include any conversational text, explanations, or extraneous characters outside the code block.
-"I need comprehensive test cases for the `BengenService.java` class. Please ensure tests are **deterministic** and cover all public methods. **make sure to import BengenService.java using 'import com.iemr.common.bengen.service.BengenService;' ensure that you use Assertions to validate void functions also i want 100% coverage on JaCoCo Reports so focus on that .also dont use DataTypeConverters 
+"I need comprehensive test cases for the `BengenService.java` class. Please ensure tests are **deterministic** and cover all public methods. **make sure to import BengenService.java using 'import com.iemr.common.bengen.service.BengenService;' ensure that you use Assertions to validate void functions also i want 100% coverage on JaCoCo Reports so focus on that .also dont use DataTypeConverters. And use Assertions
 Here is the relevant code context from the project, retrieved from the vector database:
 
 ```java
