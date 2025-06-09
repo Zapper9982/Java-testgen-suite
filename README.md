@@ -45,3 +45,5 @@ This project is built using a powerful combination of modern technologies:
 * **ChromaDB:** Our chosen Vector Database for storing and retrieving embedded code chunks efficiently.
 * **Hugging Face (BAAI/bge-small-en-v1.5):** The embedding model used for converting code chunks into high-quality vector representations.
 * **LLM Model - Groq Llama (llama3-8b-8192):** Currently leveraging this fast and efficient LLM for test case generation (exploring alternatives for scalability).
+
+* GOOD NEWS -  INTEGRATION WITH Gemini-1.5-flash was sucessfull and now will be used to generate testcases . :))
