@@ -3,33 +3,25 @@ from pathlib import Path
 import os
 from typing import List, Dict, Any, Union
 
-# Define the root of the 'testgen-automation' project (where this script lives)
 TESTGEN_AUTOMATION_ROOT = Path(__file__).parent.parent.parent
 
-# Define the root of your Spring Boot project.
+# defining the root of your Spring Boot project.
 SPRING_BOOT_PROJECT_ROOT = Path("/Users/tanmay/Desktop/AMRIT/BeneficiaryID-Generation-API")
-
-# Add the 'src' directory of the testgen-automation project to sys.path.
 TESTGEN_AUTOMATION_SRC_DIR = TESTGEN_AUTOMATION_ROOT / "src"
 if str(TESTGEN_AUTOMATION_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(TESTGEN_AUTOMATION_SRC_DIR))
     print(f"Added {TESTGEN_AUTOMATION_SRC_DIR} to sys.path for internal module imports.")
 
-
-# All Imports
 from chroma_db.chroma_client import get_chroma_client, get_or_create_collection
 from langchain_community.vectorstores import Chroma
 from langchain_community.embeddings import HuggingFaceBgeEmbeddings
-# --- CHANGE START: Use Google's Generative AI for Gemini ---
 from langchain_google_genai import ChatGoogleGenerativeAI
-# --- CHANGE END ---
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 import torch 
 
 
 # --- Google API Configuration ---
-# Get Google API Key from environment variable
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") 
 if not GOOGLE_API_KEY:
     print("WARNING: GOOGLE_API_KEY environment variable not set. Please set it for Gemini API calls.")
@@ -38,30 +30,15 @@ if not GOOGLE_API_KEY:
 # LLM model definition - Using Gemini 1.5 Flash for potentially better rate limits and speed
 # You can change this to "gemini-pro" if you prefer, but be mindful of potential limits.
 LLM_MODEL_NAME_GEMINI = "gemini-1.5-flash" 
-# --- END Google API Configuration ---
 
-# Defining the embedding model and loading to CPU 
+
+
 EMBEDDING_MODEL_NAME_BGE = "BAAI/bge-small-en-v1.5"
 DEVICE_FOR_EMBEDDINGS = "cuda" if torch.cuda.is_available() else "cpu" 
 
 
-# --- Helper Function to Derive Test File Paths ---
+#dynamic output path generator 
 def get_test_paths(original_filepath_txt: str, project_root: Path):
-    """
-    Derives the original Java filename, test class name, and full output path
-    for the generated JUnit test file.
-
-    Args:
-        original_filepath_txt (str): The 'filepath_txt' metadata from a chunk,
-                                     e.g., "processed_output/com/pkg/MyService.txt".
-        project_root (Path): The root directory of the Spring Boot project.
-
-    Returns:
-        Dict: A dictionary containing:
-              - original_java_filename (str): e.g., "MyService.java"
-              - test_output_dir (Path): The full directory path for the test file.
-              - test_output_file_path (Path): The full path to the test file.
-    """
     # 1. Get the path relative to processed_output/
     relative_path_from_processed_output = Path(original_filepath_txt).relative_to("processed_output")
 
@@ -89,15 +66,10 @@ def get_test_paths(original_filepath_txt: str, project_root: Path):
         "test_output_file_path": test_output_file_path
     }
 
-
 class TestCaseGenerator:
-    """
-    Generates JUnit 5 test cases using a LangChain RetrievalQA chain
-    with a ChromaDB retriever and a Google Gemini LLM.
-    """
     def __init__(self, collection_name: str = "code_chunks_collection"):
         print("Initializing TestCaseGenerator with LangChain components (Google Gemini LLM)...")
-        # Initializing embedding Model 
+        # initializing embedding model 
         print(f"Loading embedding model: {EMBEDDING_MODEL_NAME_BGE} on {DEVICE_FOR_EMBEDDINGS}...")
         self.embeddings = HuggingFaceBgeEmbeddings(
             model_name=EMBEDDING_MODEL_NAME_BGE,
@@ -106,7 +78,7 @@ class TestCaseGenerator:
         )
         print("Embedding model loaded.")
           
-        # 2. Instantiating ChromaDB vectorstore
+        #connection to chromaDB client
         print(f"Connecting to ChromaDB collection: {collection_name}...")
         self.chroma_client = get_chroma_client()
         self.vectorstore = Chroma(
@@ -114,18 +86,17 @@ class TestCaseGenerator:
             collection_name=collection_name,
             embedding_function=self.embeddings 
         )
-        # Initializing LangChain retriever 
+        #initialising langchain retriever with a temporary kwarg of 6 --TODO make tht dynamic
         self.retriever = self.vectorstore.as_retriever(
             search_type="mmr", 
             search_kwargs={"k": 6},#TODO-- make it dynamic because number of methods in springboot class might vary.
         )
         print("ChromaDB retriever instantiated (without initial filter).")
 
-        # Calling the LLM
         self.llm = self._instantiate_llm()
         print("Google Gemini LLM instantiated for LangChain.")
 
-        # The prompt for writing JUnit test for QA retrieval chain.
+    #prompt for writing test , but currently hardcoded will be made dynamic --TODO
         template = """
 As an expert Java developer and Spring Boot testing specialist, your task is to generate a comprehensive test cases.
 Include necessary imports, annotations, and test methods (e.g., @BeforeEach, @Test).
@@ -139,27 +110,25 @@ Here is the relevant code context from the project, retrieved from the vector da
 """
         QA_CHAIN_PROMPT = PromptTemplate.from_template(template)
 
-        # 5. Instantiate the RetrievalQA Chain
+
         print("Instantiating LangChain RetrievalQA Chain...")
         self.qa_chain = RetrievalQA.from_chain_type(
             llm=self.llm,
             chain_type="stuff",
             retriever=self.retriever,
-            return_source_documents=True, # Ensure this is True to get source_documents
+            return_source_documents=True, 
             chain_type_kwargs={"prompt": QA_CHAIN_PROMPT}
         )
         print("RetrievalQA Chain initialized.")
 
-    # --- CHANGE START: Use ChatGoogleGenerativeAI ---
+#  Using gemini ChatGoogleGenerativeAI
     def _instantiate_llm(self) -> ChatGoogleGenerativeAI:
-        """Instantiates the Google Gemini LLM for LangChain."""
         if not GOOGLE_API_KEY:
             raise ValueError("GOOGLE_API_KEY environment variable is not set. Cannot initialize Gemini LLM.")
         
-        # The API key is usually picked up automatically by the library if set as GOOGLE_API_KEY env var
         print(f"Using Google Gemini LLM: {LLM_MODEL_NAME_GEMINI}...")
         return ChatGoogleGenerativeAI(model=LLM_MODEL_NAME_GEMINI, temperature=0.7)
-    # --- CHANGE END ---
+
 
     def _update_retriever_filter(self, filename: str):
         """Updates the retriever's filter to target a specific filename."""
@@ -235,7 +204,7 @@ Here is the relevant code context from the project, retrieved from the vector da
             return f"Error during LLM generation with LangChain (Google Gemini): {e}. " \
                    "Ensure your GOOGLE_API_KEY is correct and you have access to Google Generative AI API."
 
-# MAIN function 
+
 if __name__ == "__main__":
     try:
         test_generator = TestCaseGenerator(collection_name="code_chunks_collection") 
@@ -265,13 +234,12 @@ if __name__ == "__main__":
             print(f"EXPECTED TEST OUTPUT PATH: '{test_output_file_path}'")
             print("="*80)
 
-            # Update the retriever's filter for the current target file
+            # retriever filter is updated 
             test_generator._update_retriever_filter(target_filename_for_filter)
 
-            # Generate the test case
+            # generation of the test case by calling the function with a query 
             generated_test_code = test_generator.generate_test_case(query)
             
-            # Ensure the output directory exists
             os.makedirs(test_output_dir, exist_ok=True)
 
             # Write the generated test case to the file
