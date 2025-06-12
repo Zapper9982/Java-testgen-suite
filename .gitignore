@@ -6,3 +6,4 @@
 /chromadata/ 
 src/test/*
 llm/__pycache__
+/analysis_results/
