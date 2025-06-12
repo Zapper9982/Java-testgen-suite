@@ -21,14 +21,12 @@ from langchain.prompts import PromptTemplate
 import torch 
 
 
-# --- Google API Configuration ---
+# API config
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") 
 if not GOOGLE_API_KEY:
     print("WARNING: GOOGLE_API_KEY environment variable not set. Please set it for Gemini API calls.")
     print("Example: export GOOGLE_API_KEY='your_google_api_key_here'")
 
-# LLM model definition - Using Gemini 1.5 Flash for potentially better rate limits and speed
-# You can change this to "gemini-pro" if you prefer, but be mindful of potential limits.
 LLM_MODEL_NAME_GEMINI = "gemini-1.5-flash" 
 
 
@@ -39,25 +37,12 @@ DEVICE_FOR_EMBEDDINGS = "cuda" if torch.cuda.is_available() else "cpu"
 
 #dynamic output path generator 
 def get_test_paths(original_filepath_txt: str, project_root: Path):
-    # 1. Get the path relative to processed_output/
     relative_path_from_processed_output = Path(original_filepath_txt).relative_to("processed_output")
-
-    # 2. Get the package path (directory part)
     package_path = relative_path_from_processed_output.parent
-
-    # 3. Get the original filename base (without .txt or .java)
     original_filename_base = relative_path_from_processed_output.stem 
-
-    # 4. Construct the original .java filename for filtering
     original_java_filename = f"{original_filename_base}.java" 
-
-    # 5. Construct the test class name (e.g., "MyServiceTest.java")
     test_class_name = f"{original_filename_base}Test.java"
-
-    # 6. Construct the full output directory for the test file
     test_output_dir = project_root / "src" / "test" / "java" / package_path
-
-    # 7. Construct the full output file path
     test_output_file_path = test_output_dir / test_class_name
 
     return {
@@ -139,7 +124,6 @@ Here is the relevant code context from the project, retrieved from the vector da
                 "filter": {"filename": filename}
             },
         )
-        # Update the QA chain with the new retriever
         self.qa_chain.retriever = self.retriever
         print(f"Retriever filter updated to target filename: '{filename}'")
 
