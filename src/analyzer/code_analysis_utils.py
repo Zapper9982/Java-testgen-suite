@@ -2,22 +2,8 @@ import re
 from pathlib import Path
 from typing import List, Dict, Any, Union
 
-# This file (code_analysis_utils.py) is intended to be a utility module.
-# It does not need to define TESTGEN_AUTOMATION_ROOT directly, as it will be imported
-# by other scripts that manage the root paths.
-# If this file were run standalone, these defaults might be useful, but for modularity,
-# it's best to rely on paths passed from the calling script.
-
 def extract_custom_imports_from_chunk_file(processed_filepath_txt: Path) -> List[str]:
-    """
-    Reads a processed_output .txt file and extracts unique 'com.iemr.' import statements.
 
-    Args:
-        processed_filepath_txt: The absolute Path object to the processed .txt file.
-
-    Returns:
-        A list of unique import statements starting with 'com.iemr.'.
-    """
     custom_imports = set()
     import_pattern = re.compile(r"^\s*import\s+(com\.iemr\..*?);", re.MULTILINE)
 
@@ -79,10 +65,7 @@ class CodeAnalyser:
         }
 
 class SpringBootAnalyser:
-    """
-    Scans a Spring Boot project's 'src/main/java' directory to discover
-    Service and Controller classes and extracts their metadata.
-    """
+
     def __init__(self, project_main_java_dir: Path, processed_output_root: Path):
         self.project_main_java_dir = project_main_java_dir
         self.processed_output_root = processed_output_root
@@ -91,10 +74,7 @@ class SpringBootAnalyser:
         self.code_analyser = CodeAnalyser(project_main_java_dir)
 
     def discover_targets(self) -> List[Dict[str, str]]:
-        """
-        Discovers Spring Boot Service and Controller classes and
-        extracts their file name, location, and internal imports.
-        """
+
         discovered_targets = []
         print(f"\nScanning Spring Boot project for Services and Controllers in: {self.project_main_java_dir}")
 
