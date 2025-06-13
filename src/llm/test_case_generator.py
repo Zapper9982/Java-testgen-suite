@@ -5,7 +5,11 @@ import json
 from typing import List, Dict, Any, Union
 
 TESTGEN_AUTOMATION_ROOT = Path(__file__).parent.parent.parent
-SPRING_BOOT_PROJECT_ROOT = Path("/Users/tanmay/Desktop/AMRIT/BeneficiaryID-Generation-API")
+import os
+SPRING_BOOT_PROJECT_ROOT_STR = os.getenv("SPRING_BOOT_PROJECT_ROOT")
+if not SPRING_BOOT_PROJECT_ROOT_STR:
+    raise ValueError("Environment variable SPRING_BOOT_PROJECT_ROOT not set.")
+SPRING_BOOT_PROJECT_ROOT = Path(SPRING_BOOT_PROJECT_ROOT_STR)
 SPRING_BOOT_MAIN_JAVA_DIR = SPRING_BOOT_PROJECT_ROOT / "src" / "main" / "java"
 PROCESSED_OUTPUT_ROOT = TESTGEN_AUTOMATION_ROOT / "processed_output" 
 TESTGEN_AUTOMATION_SRC_DIR = TESTGEN_AUTOMATION_ROOT / "src"
@@ -22,7 +26,8 @@ from langchain_community.embeddings import HuggingFaceBgeEmbeddings
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
-import torch 
+import torch
+import logging # Added for logger
 
 
 # --- Google API Configuration ---
@@ -96,6 +101,7 @@ class TestCaseGenerator:
 
         self.java_test_runner = JavaTestRunner(project_root=SPRING_BOOT_PROJECT_ROOT, build_tool=build_tool) # Initialize the test runner
         self.last_test_run_results = None # Initialize to store feedback
+        self.logger = logging.getLogger(__name__) # Added logger instance
 
     def _instantiate_llm(self) -> ChatGoogleGenerativeAI:
         if not GOOGLE_API_KEY:
@@ -170,6 +176,7 @@ Here is the relevant code context from the project, retrieved from the vector da
                            custom_imports: List[str],
                            relevant_java_files_for_context: List[str],
                            test_output_file_path: Path, # Added to save generated code
+                           focused_methods: List[Dict[str, Any]] | None = None, # New parameter
                            additional_query_instructions: str = "") -> str:
         """
         Generates a JUnit 5 test case by querying the RetrievalQA chain,
@@ -177,8 +184,50 @@ Here is the relevant code context from the project, retrieved from the vector da
         """
         self._update_retriever_filter(relevant_java_files_for_context)
 
+        current_additional_instructions = additional_query_instructions
+
+        if focused_methods:
+            # Assuming class_name in focused_methods might be fully qualified or simple.
+            # target_class_name is simple.
+            # A more robust check would be to compare against fqcn if available in focused_methods.
+            relevant_focused_methods_for_this_class = [
+                fm for fm in focused_methods
+                if fm.get("class_name","").endswith(target_class_name)
+            ]
+            if relevant_focused_methods_for_this_class:
+                instruction_intro = (
+                    "\n\n--- FOCUSED COVERAGE IMPROVEMENT ---\n"
+                    "The following methods in this class have been identified as needing better test coverage. "
+                    "Please prioritize generating tests that specifically exercise these methods and improve their line coverage. "
+                    "Pay close attention to their logic, branches, and edge cases:\n"
+                )
+                methods_str_parts = []
+                # Ensure TARGET_COVERAGE is accessible, e.g. via os.getenv or passed in
+                # For simplicity here, directly using a default or assuming it's part of the broader context.
+                # If TestCaseGenerator is meant to be more isolated, this might need to be passed.
+                target_coverage_str = os.getenv('TARGET_COVERAGE', '0.9')
+                try:
+                    target_coverage_val = float(target_coverage_str)
+                except ValueError:
+                    target_coverage_val = 0.9 # Default if env var is invalid
+
+                for fm_info in relevant_focused_methods_for_this_class:
+                    methods_str_parts.append(
+                        f"- Method: `{fm_info.get('method_name', 'N/A')}` (Signature: `{fm_info.get('method_signature', 'N/A')}` "
+                        f"Current Coverage: {fm_info.get('line_coverage', 0.0)*100:.1f}%, "
+                        f"Target: >{target_coverage_val*100:.0f}%)"
+                    )
+                focused_instruction = instruction_intro + "\n".join(methods_str_parts) + "\n--- END FOCUSED COVERAGE IMPROVEMENT ---\n"
+
+                if current_additional_instructions:
+                    current_additional_instructions += "\n" + focused_instruction
+                else:
+                    current_additional_instructions = focused_instruction
+
+                self.logger.info(f"Added focused coverage instructions for {len(relevant_focused_methods_for_this_class)} methods in {target_class_name}.")
+
         base_template = self._get_base_prompt_template(
-            target_class_name, target_package_name, custom_imports, additional_query_instructions
+            target_class_name, target_package_name, custom_imports, current_additional_instructions
         )
 
         generated_code = ""

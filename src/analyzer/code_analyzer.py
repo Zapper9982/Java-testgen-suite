@@ -5,7 +5,11 @@ from typing import List, Dict, Any, Union
 
 #imports
 TESTGEN_AUTOMATION_ROOT = Path(__file__).parent.parent.parent 
-SPRING_BOOT_PROJECT_ROOT = Path("/Users/tanmay/Desktop/AMRIT/BeneficiaryID-Generation-API")
+import os
+SPRING_BOOT_PROJECT_ROOT_STR = os.getenv("SPRING_BOOT_PROJECT_ROOT")
+if not SPRING_BOOT_PROJECT_ROOT_STR:
+    raise ValueError("Environment variable SPRING_BOOT_PROJECT_ROOT not set.")
+SPRING_BOOT_PROJECT_ROOT = Path(SPRING_BOOT_PROJECT_ROOT_STR)
 SPRING_BOOT_MAIN_JAVA_DIR = SPRING_BOOT_PROJECT_ROOT / "src" / "main" / "java"
 PROCESSED_OUTPUT_ROOT = TESTGEN_AUTOMATION_ROOT / "processed_output"
 TESTGEN_AUTOMATION_SRC_DIR = TESTGEN_AUTOMATION_ROOT / "src"

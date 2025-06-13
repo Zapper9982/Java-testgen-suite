@@ -1,0 +1,82 @@
+name: Java Test Coverage Check
+
+on:
+  push:
+    branches: [ main, master ] # Adjust branches as needed
+  pull_request:
+    branches: [ main, master ] # Adjust branches as needed
+
+jobs:
+  test-coverage-check:
+    runs-on: ubuntu-latest
+
+    env:
+      # SPRING_BOOT_PROJECT_ROOT: ${{ github.workspace }}/your-spring-boot-project-dir # If SB project is in a subdir
+      SPRING_BOOT_PROJECT_ROOT: ${{ github.workspace }} # Assuming SB project is at the root of the repo
+      # GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }} # Required by TestCaseGenerator
+      # MAX_ITERATIONS: 3 # Optional: Override default max iterations
+      # TARGET_COVERAGE: 0.9 # Optional: Override default target coverage
+      # BUILD_TOOL: "maven" # Optional: specify maven or gradle, defaults to maven in scripts
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up JDK
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17' # Specify the Java version required by the Spring Boot project
+        distribution: 'temurin' # Or any other distribution
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10' # Specify Python version used for the test generator scripts
+
+    - name: Install Python dependencies
+      run: |
+        python -m pip install --upgrade pip
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+    - name: Set up Maven (if using Maven) # Conditional step
+      if: env.BUILD_TOOL == 'maven' || env.BUILD_TOOL == '' # Default to maven if not set
+      run: |
+        # Maven is usually pre-installed on ubuntu-latest runners. This step can ensure specific version or settings if needed.
+        mvn --version
+
+    - name: Set up Gradle (if using Gradle) # Conditional step
+      if: env.BUILD_TOOL == 'gradle'
+      run: |
+        # Gradle might need to be set up or ensured it's available
+        # Ensure gradlew is executable if it exists
+        if [ -f "./gradlew" ]; then chmod +x ./gradlew; fi
+        ./gradlew --version # Check if gradlew wrapper is present and executable
+
+    - name: Run Test Generation and Coverage Check Pipeline
+      run: |
+        # Ensure SPRING_BOOT_PROJECT_ROOT is correctly set if it's a subdirectory
+        # export SPRING_BOOT_PROJECT_ROOT=${{ github.workspace }}/path-to-your-java-project
+        # Ensure GOOGLE_API_KEY is available if your LLM calls are not mocked
+        if [ -z "$GOOGLE_API_KEY" ]; then
+          echo "Warning: GOOGLE_API_KEY is not set. LLM calls might fail if not mocked."
+          # You might want to fail here if the key is essential:
+          # echo "Error: GOOGLE_API_KEY is required."
+          # exit 1
+        fi
+
+        echo "Running main pipeline from src/main.py..."
+        python src/main.py
+      env:
+        # Pass the Google API Key as an environment variable to the script
+        GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+
+    # Optional: Upload JaCoCo reports as artifacts
+    - name: Upload JaCoCo Report
+      if: always() # Run this step even if the pipeline fails, to get the last report
+      uses: actions/upload-artifact@v4
+      with:
+        name: jacoco-report
+        path: | # Adjust paths based on build tool and actual output
+          ${{ env.SPRING_BOOT_PROJECT_ROOT }}/target/site/jacoco/jacoco.xml
+          ${{ env.SPRING_BOOT_PROJECT_ROOT }}/build/reports/jacoco/test/jacocoTestReport.xml
+        if-no-files-found: ignore # Don't fail if a path is not found (e.g. Maven vs Gradle)
