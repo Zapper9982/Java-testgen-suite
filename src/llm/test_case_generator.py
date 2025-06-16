@@ -5,8 +5,8 @@ import json
 from typing import List, Dict, Any, Union
 
 TESTGEN_AUTOMATION_ROOT = Path(__file__).parent.parent.parent
-SPRING_BOOT_PROJECT_ROOT = Path("/Users/tanmay/Desktop/AMRIT/BeneficiaryID-Generation-API")
-SPRING_BOOT_MAIN_JAVA_DIR = SPRING_BOOT_PROJECT_ROOT / "src" / "main" / "java"
+SPRING_BOOT_PROJECT_ROOT = os.getenv("SPRING_BOOT_PROJECT_PATH")
+SPRING_BOOT_MAIN_JAVA_DIR = Path(SPRING_BOOT_PROJECT_ROOT) / "src" / "main" / "java"
 PROCESSED_OUTPUT_ROOT = TESTGEN_AUTOMATION_ROOT / "processed_output" 
 TESTGEN_AUTOMATION_SRC_DIR = TESTGEN_AUTOMATION_ROOT / "src"
 if str(TESTGEN_AUTOMATION_SRC_DIR) not in sys.path:
