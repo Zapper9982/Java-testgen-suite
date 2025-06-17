@@ -1,7 +1,7 @@
 import subprocess
 from pathlib import Path
 from typing import Dict, Any, Optional
-import os
+import os , re
 class JavaTestRunner:
 
     def __init__(self, project_root: Path, build_tool: str = "maven"):

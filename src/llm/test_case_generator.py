@@ -4,14 +4,23 @@ import os
 import json 
 from typing import List, Dict, Any, Union
 
+
 TESTGEN_AUTOMATION_ROOT = Path(__file__).parent.parent.parent
-SPRING_BOOT_PROJECT_ROOT = os.getenv("SPRING_BOOT_PROJECT_PATH")
-SPRING_BOOT_MAIN_JAVA_DIR = Path(SPRING_BOOT_PROJECT_ROOT) / "src" / "main" / "java"
+SPRING_BOOT_PROJECT_ROOT_ENV = os.getenv("SPRING_BOOT_PROJECT_PATH")
+if not SPRING_BOOT_PROJECT_ROOT_ENV:
+    print("ERROR: SPRING_BOOT_PROJECT_PATH environment variable is not set.")
+    print("Please set it in your run.sh script or before running test_case_generator.py.")
+    sys.exit(1)
+SPRING_BOOT_PROJECT_ROOT = Path(SPRING_BOOT_PROJECT_ROOT_ENV)
+SPRING_BOOT_MAIN_JAVA_DIR = SPRING_BOOT_PROJECT_ROOT / "src" / "main" / "java" 
+
+
 PROCESSED_OUTPUT_ROOT = TESTGEN_AUTOMATION_ROOT / "processed_output" 
 TESTGEN_AUTOMATION_SRC_DIR = TESTGEN_AUTOMATION_ROOT / "src"
 if str(TESTGEN_AUTOMATION_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(TESTGEN_AUTOMATION_SRC_DIR))
     print(f"Added {TESTGEN_AUTOMATION_SRC_DIR} to sys.path for internal module imports.")
+
 
 from analyzer.code_analysis_utils import extract_custom_imports_from_chunk_file 
 from test_runner.java_test_runner import JavaTestRunner 
@@ -25,34 +34,46 @@ from langchain.prompts import PromptTemplate
 import torch 
 
 
-# --- Google API Configuration ---
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") 
 if not GOOGLE_API_KEY:
     print("WARNING: GOOGLE_API_KEY environment variable not set. Please set it for Gemini API calls.")
     print("Example: export GOOGLE_API_KEY='your_google_api_key_here'")
 
-# LLM model definition - Using Gemini 1.5 Flash for potentially better rate limits and speed
+
 LLM_MODEL_NAME_GEMINI = "gemini-1.5-flash" 
 
 EMBEDDING_MODEL_NAME_BGE = "BAAI/bge-small-en-v1.5"
-DEVICE_FOR_EMBEDDINGS = "cuda" if torch.cuda.is_available() else "cpu" 
+if torch.backends.mps.is_available():
+    DEVICE_FOR_EMBEDDINGS = "mps"
+    print("Detected Apple Silicon (M1/M2/M3). Using 'mps' device for embeddings.")
+else:
+    DEVICE_FOR_EMBEDDINGS = "cpu"
+    print("Apple Silicon MPS not available or detected. Falling back to 'cpu' for embeddings.")
 
-# Define the expected location of the pre-analyzed Spring Boot targets JSON file
 ANALYSIS_RESULTS_DIR = TESTGEN_AUTOMATION_ROOT / "analysis_results"
 ANALYSIS_RESULTS_FILE = ANALYSIS_RESULTS_DIR / "spring_boot_targets.json"
 
-# Max retries for test generation + fixing
-MAX_TEST_GENERATION_RETRIES = 5 
+
+MAX_TEST_GENERATION_RETRIES = 6
 
 def get_test_paths(relative_filepath_from_processed_output: str, project_root: Path):
- 
-   
+    
     relative_path_obj = Path(relative_filepath_from_processed_output)
+
     package_path = relative_path_obj.parent
+
+    
     original_filename_base = relative_path_obj.stem 
+
+
     original_java_filename = f"{original_filename_base}.java" 
+
     test_class_name = f"{original_filename_base}Test.java"
+
+
     test_output_dir = project_root / "src" / "test" / "java" / package_path
+
+
     test_output_file_path = test_output_dir / test_class_name
 
     return {
@@ -63,7 +84,7 @@ def get_test_paths(relative_filepath_from_processed_output: str, project_root: P
 
 
 class TestCaseGenerator:
-    def __init__(self, collection_name: str = "code_chunks_collection", build_tool: str = "maven"): # Added build_tool
+    def __init__(self, collection_name: str = "code_chunks_collection", build_tool: str = "maven"): 
         print("Initializing TestCaseGenerator with LangChain components (Google Gemini LLM)...")
         
         print(f"Loading embedding model: {EMBEDDING_MODEL_NAME_BGE} on {DEVICE_FOR_EMBEDDINGS}...")
@@ -81,7 +102,7 @@ class TestCaseGenerator:
             collection_name=collection_name,
             embedding_function=self.embeddings 
         )
-        # Initialize retriever with a default k. It will be updated dynamically later.
+      
         self.retriever = self.vectorstore.as_retriever(
             search_type="mmr", 
             search_kwargs={"k": 15},
@@ -91,11 +112,13 @@ class TestCaseGenerator:
         self.llm = self._instantiate_llm()
         print("Google Gemini LLM instantiated for LangChain.")
 
-        # QA chain will be initialized/updated dynamically in generate_test_case
         self.qa_chain = None 
 
-        self.java_test_runner = JavaTestRunner(project_root=SPRING_BOOT_PROJECT_ROOT, build_tool=build_tool) # Initialize the test runner
-        self.last_test_run_results = None # Initialize to store feedback
+        project_root_from_env = os.getenv("SPRING_BOOT_PROJECT_PATH")
+        if not project_root_from_env:
+            raise ValueError("SPRING_BOOT_PROJECT_PATH environment variable is not set. Cannot initialize JavaTestRunner.")
+        self.java_test_runner = JavaTestRunner(project_root=Path(project_root_from_env), build_tool=build_tool)
+        self.last_test_run_results = None 
 
     def _instantiate_llm(self) -> ChatGoogleGenerativeAI:
         if not GOOGLE_API_KEY:
@@ -105,33 +128,29 @@ class TestCaseGenerator:
         return ChatGoogleGenerativeAI(model=LLM_MODEL_NAME_GEMINI, temperature=0.7)
 
     def _update_retriever_filter(self, filenames: Union[str, List[str]]):
-        """
-        Updates the retriever's filter to target a specific filename or a list of filenames.
-        This allows the retriever to fetch chunks from the target file and its dependencies.
-        """
+
         if isinstance(filenames, str):
             filter_filenames = [filenames]
         else:
             filter_filenames = filenames 
 
-        # Using $in operator to filter by multiple filenames
         self.retriever = self.vectorstore.as_retriever(
             search_type="mmr",
             search_kwargs={
-                "k": 15, # Still a TODO for dynamic adjustment, consider increasing if context is too small
+                "k": 15, 
                 "filter": {"filename": {"$in": filter_filenames}}
             },
         )
-        # Update the QA chain with the new retriever if it's already initialized.
+
         if self.qa_chain:
             self.qa_chain.retriever = self.retriever
         print(f"Retriever filter updated to target filenames: '{filter_filenames}'")
 
     def _get_base_prompt_template(self, target_class_name: str, target_package_name: str, custom_imports: List[str], additional_query_instructions: str) -> str:
-        """Constructs the base prompt template for test generation."""
+
         formatted_custom_imports = "\n".join(custom_imports)
-        
-        return f"""
+
+        template = """
 As an expert Java developer and Spring Boot testing specialist, your task is to generate a comprehensive JUnit 5 test class for the `{target_class_name}` class.
 **Crucially, follow these rules for the test class structure and Mockito setup:**
 1.  Use `@ExtendWith(MockitoExtension.class)` for JUnit 5.
@@ -162,7 +181,13 @@ Here is the relevant code context from the project, retrieved from the vector da
 ```java
 {{context}}
 // Begin generated test code
-"""
+""".format(
+            target_class_name=target_class_name,
+            target_package_name=target_package_name,
+            formatted_custom_imports=formatted_custom_imports,
+            additional_query_instructions=additional_query_instructions
+        )
+        return template
     
     def generate_test_case(self, 
                            target_class_name: str, 
@@ -175,6 +200,7 @@ Here is the relevant code context from the project, retrieved from the vector da
         Generates a JUnit 5 test case by querying the RetrievalQA chain,
         with a dynamically constructed prompt, and includes a feedback loop for corrections.
         """
+
         self._update_retriever_filter(relevant_java_files_for_context)
 
         base_template = self._get_base_prompt_template(
@@ -184,30 +210,40 @@ Here is the relevant code context from the project, retrieved from the vector da
         generated_code = ""
         for retry_attempt in range(MAX_TEST_GENERATION_RETRIES):
             print(f"\nAttempt {retry_attempt + 1}/{MAX_TEST_GENERATION_RETRIES} for test generation for {target_class_name}...")
- 
+            
+
             current_prompt_query = f"Generate tests for {target_class_name}."
             if retry_attempt > 0 and self.last_test_run_results:
-    
+
+                stdout_content = self.last_test_run_results.get('stdout', '').replace('{', '{{').replace('}', '}}')
+                stderr_content = self.last_test_run_results.get('stderr', '').replace('{', '{{').replace('}', '}}')
+
                 error_feedback_message = (
-                    f"\n\n--- PREVIOUS ATTEMPT FEEDBACK ---\n"
-                    f"The previously generated test for `{target_class_name}` encountered the following issue:\n"
-                    f"Status: {self.last_test_run_results['status']}\n"
-                    f"Message: {self.last_test_run_results['message']}\n"
-                    f"STDOUT:\n{self.last_test_run_results['stdout']}\n"
-                    f"STDERR:\n{self.last_test_run_results['stderr']}\n"
-                    f"Please analyze the errors/failures and revise the test code to fix them."
-                    f"Ensure you still adhere to all original instructions (Mockito usage, coverage, imports, etc.)."
-                    f"\n--- END PREVIOUS ATTEMPT FEEDBACK ---\n"
+                    "\n\n--- PREVIOUS ATTEMPT FEEDBACK ---\n"
+                    "The previously generated test for `{target_class_name}` encountered the following issue:\n"
+                    "Status: {status}\n"
+                    "Message: {message}\n"
+                    "STDOUT:\n{stdout_content}\n"
+                    "STDERR:\n{stderr_content}\n"
+                    "Please analyze the errors/failures and revise the test code to fix them."
+                    "Ensure you still adhere to all original instructions (Mockito usage, coverage, imports, etc.)."
+                    "\n--- END PREVIOUS ATTEMPT FEEDBACK ---\n"
+                ).format(
+                    target_class_name=target_class_name,
+                    status=self.last_test_run_results.get('status', 'N/A'),
+                    message=self.last_test_run_results.get('message', 'N/A'),
+                    stdout_content=stdout_content,
+                    stderr_content=stderr_content
                 )
-     
+
                 template_with_feedback = base_template + error_feedback_message 
                 QA_CHAIN_PROMPT = PromptTemplate.from_template(template_with_feedback)
             else:
                 QA_CHAIN_PROMPT = PromptTemplate.from_template(base_template)
 
-            if self.qa_chain: 
+            if self.qa_chain:
                 self.qa_chain.combine_documents_chain.llm_chain.prompt = QA_CHAIN_PROMPT
-            else: 
+            else: # Initialize new chain if it doesn't exist
                 self.qa_chain = RetrievalQA.from_chain_type(
                     llm=self.llm,
                     chain_type="stuff",
@@ -237,11 +273,10 @@ Here is the relevant code context from the project, retrieved from the vector da
                 if not temp_generated_code or temp_generated_code.lower().startswith("here is the"):
                     print(f"LLM generated an incomplete or conversational response. Retrying...")
                     self.last_test_run_results = {"status": "ERROR", "message": "LLM generated incomplete or conversational code.", "stdout": response_text, "stderr": "No executable code block found."}
-                    continue 
+                    continue
 
                 generated_code = temp_generated_code 
 
-               
                 os.makedirs(test_output_file_path.parent, exist_ok=True)
                 with open(test_output_file_path, 'w', encoding='utf-8') as f:
                     f.write(generated_code)
@@ -256,25 +291,25 @@ Here is the relevant code context from the project, retrieved from the vector da
                 elif test_run_results["status"] == "FAILED" or test_run_results["status"] == "ERROR":
                     print(f"Test for {target_class_name} FAILED/ERRORED on attempt {retry_attempt + 1}. Message: {test_run_results['message']}")
                     print("Feeding error feedback to LLM for next attempt...")
-     
-                else: # UNKNOWN status
+               
+                else: 
                     print(f"Test for {target_class_name} returned UNKNOWN status on attempt {retry_attempt + 1}. Message: {test_run_results['message']}")
-                    print("Feeding unknown status feedback to LLM for next attempt...")
-    
+                    print("Feeding unknown status feedback to LLM for next RegEx...")
+                 
 
             except Exception as e:
                 print(f"An error occurred during LLM call or test execution setup: {e}. Retrying...")
                 self.last_test_run_results = {"status": "ERROR", "message": f"Internal generation/execution error: {e}", "stdout": "", "stderr": str(e)}
  
+
         print(f"Failed to generate a passing test for {target_class_name} after {MAX_TEST_GENERATION_RETRIES} attempts.")
-        return generated_code
+        return generated_code 
 
 if __name__ == "__main__":
     try:
-     
+
         BUILD_TOOL = os.getenv("BUILD_TOOL", "maven").lower() 
         test_generator = TestCaseGenerator(collection_name="code_chunks_collection", build_tool=BUILD_TOOL) 
-        
 
         if not ANALYSIS_RESULTS_FILE.exists():
             print(f"ERROR: Analysis results file not found: {ANALYSIS_RESULTS_FILE}")
@@ -291,8 +326,9 @@ if __name__ == "__main__":
             print("No Spring Boot Service or Controller targets found in analysis results. Exiting test generation.")
             sys.exit(0) 
 
+
         for target_info in discovered_targets_metadata:
-           
+
             java_file_path_abs = Path(target_info['java_file_path_abs'])
             relative_processed_txt_path = Path(target_info['relative_processed_txt_path']) 
             target_class_name = target_info['class_name']
@@ -301,9 +337,8 @@ if __name__ == "__main__":
             custom_imports_list = target_info['custom_imports'] 
 
             relevant_java_files_for_context = [java_file_path_abs.name] + identified_dependencies_filenames
-            relevant_java_files_for_context = list(set(relevant_java_files_for_context)) # Ensure uniqueness
-            
-     
+            relevant_java_files_for_context = list(set(relevant_java_files_for_context)) 
+
             paths = get_test_paths(str(relative_processed_txt_path), SPRING_BOOT_PROJECT_ROOT)
             test_output_dir = paths["test_output_dir"]
             test_output_file_path = paths["test_output_file_path"]
@@ -316,7 +351,6 @@ if __name__ == "__main__":
             print(f"EXPECTED TEST OUTPUT PATH: '{test_output_file_path}'")
             print("="*80)
 
-            # --- Generate the test case with feedback loop ---
             generated_test_code = test_generator.generate_test_case(
                 target_class_name=target_class_name,
                 target_package_name=target_package_name,
@@ -327,7 +361,6 @@ if __name__ == "__main__":
             )
             
             os.makedirs(test_output_dir, exist_ok=True)
-
             try:
                 with open(test_output_file_path, 'w', encoding='utf-8') as f:
                     f.write(generated_test_code)
@@ -336,13 +369,29 @@ if __name__ == "__main__":
                 print(f"\n[FINAL ERROR] Could not save test case to '{test_output_file_path}': {e}")
 
             print("\n--- FINAL GENERATED TEST CASE (Printed to Console for review) ---")
-            print(generated_test_code)
+            print(generated_test_code) 
             print("\n" + "="*80 + "\n")
-            
+
+        print("\nInitiating full project test verification (mvn clean verify / gradle clean test)...")
+        full_project_test_results = test_generator.java_test_runner.run_project_tests(is_full_verify=True)
+        
+        print("\n--- Full Project Test Verification Results ---")
+        print(f"Status: {full_project_test_results['status']}")
+        print(f"Message: {full_project_test_results['message']}")
+        if full_project_test_results.get('summary'): 
+            print(f"Summary: {full_project_test_results['summary']}")
+        else:
+            print("No detailed test summary available from build tool output.")
+        
+        if full_project_test_results['status'] != "SUCCESS":
+            print("\nWARNING: Full project verification FAILED or had ERRORS. Check logs above.")
+  
+        print("\n--- Full Project Test Verification Completed ---")
+
+
     except ValueError as ve:
         print(f"Configuration Error: {ve}")
         print("Please ensure GOOGLE_API_KEY is set and other configurations are correct, especially file paths.")
     except Exception as e:
         print(f"An unexpected error occurred during main execution: {e}")
         print("Verify your ChromaDB setup and network connection for Google Generative AI API, and that file paths are correct.")
-

@@ -73,7 +73,6 @@ def embed_text(text: str, max_retries: int = 3, backoff: float = 1.0):
             vector = (summed_embeddings / num_tokens).squeeze().cpu().tolist()
             return vector
         except RuntimeError as e:
-            # Catch CUDA OOM or other runtime errors
             if "CUDA out of memory" in str(e) and DEVICE == "cuda":
                 print(f"[WARN] CUDA OOM, consider reducing batch size or using CPU for next attempt...")
                 # If processing in batches, you might want to try a smaller batch here
@@ -112,7 +111,7 @@ def main():
     collection = get_or_create_collection(client, name="code_chunks_collection")
 
     # Process chunks in batches (optional, but good for performance)
-    batch_size = 32 # Adjust based on your GPU memory and model size
+    batch_size = 128
     num_chunks = len(chunks)
     
     print(f"Starting ingestion of {num_chunks} chunks into ChromaDB...")
