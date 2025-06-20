@@ -1,9 +1,20 @@
 import re
 from pathlib import Path
-from typing import List, Dict, Any, Union
+from typing import List, Dict, Any, Union, Optional
+
+# This file (code_analysis_utils.py) is a utility module within the 'analyzer' package.
+# It does not define root paths; those are passed from the calling scripts.
 
 def extract_custom_imports_from_chunk_file(processed_filepath_txt: Path) -> List[str]:
+    """
+    Reads a processed_output .txt file and extracts unique 'com.iemr.' import statements.
 
+    Args:
+        processed_filepath_txt: The absolute Path object to the processed .txt file.
+
+    Returns:
+        A list of unique import statements starting with 'com.iemr.'.
+    """
     custom_imports = set()
     import_pattern = re.compile(r"^\s*import\s+(com\.iemr\..*?);", re.MULTILINE)
 
@@ -64,52 +75,106 @@ class CodeAnalyser:
             "dependent_filenames": sorted(list(dependent_filenames))
         }
 
-class SpringBootAnalyser:
+    def _detect_db_dependency_in_content(self, java_code: str, class_name: str) -> bool:
+        """
+        Detects if a Java class likely requires a test database for integration testing.
+        Checks for common indicators like @Repository, @Transactional, and Spring Data JPA dependencies.
+        """
+        # 1. Check for @Repository annotation on the class itself
+        if re.search(r"@Repository\s*(?:public\s+)?(?:class|interface|enum)\s+" + re.escape(class_name), java_code):
+            return True
 
+        # 2. Check for @Transactional annotation on class or methods
+        if re.search(r"@Transactional", java_code):
+            return True
+
+        # 3. Check for injection of Spring Data JPA Repositories or similar persistence interfaces
+        repository_injection_pattern = re.compile(
+            r"@(?:Autowired|Inject)\s+private\s+(?:final\s+)?([a-zA-Z0-9_]+(?:Repository|Dao|Mapper))\s+\w+;",
+            re.MULTILINE
+        )
+        if repository_injection_pattern.search(java_code):
+            return True
+        
+        # 4. Check for direct usage of EntityManager or JdbcTemplate
+        if re.search(r"\bEntityManager\b|\bJdbcTemplate\b", java_code):
+            return True
+
+        return False
+
+
+class SpringBootAnalyser:
+    """
+    Scans a Spring Boot project's 'src/main/java' directory to discover
+    Service and Controller classes and extracts their metadata.
+    """
     def __init__(self, project_main_java_dir: Path, processed_output_root: Path):
         self.project_main_java_dir = project_main_java_dir
         self.processed_output_root = processed_output_root
         self.service_annotation_pattern = re.compile(r"@Service")
         self.controller_annotation_pattern = re.compile(r"@(?:Rest)?Controller")
-        self.code_analyser = CodeAnalyser(project_main_java_dir)
+        self.code_analyser = CodeAnalyser(project_main_java_dir) # Reuse CodeAnalyser's logic
 
     def discover_targets(self) -> List[Dict[str, str]]:
-
+        """
+        Discovers Spring Boot Service and Controller classes and
+        extracts their file name, location, and internal imports.
+        Only includes targets explicitly identified as Service or Controller.
+        """
         discovered_targets = []
         print(f"\nScanning Spring Boot project for Services and Controllers in: {self.project_main_java_dir}")
 
         for java_file_path in self.project_main_java_dir.rglob("*.java"):
             try:
-                content = java_file_path.read_text(encoding='utf-8')
-                is_service = self.service_annotation_pattern.search(content)
-                is_controller = self.controller_annotation_pattern.search(content)
+                # First, determine the path to the *processed* .txt file
+                relative_path_from_main_java = java_file_path.relative_to(self.project_main_java_dir)
+                relative_processed_txt_path = relative_path_from_main_java.parent / (relative_path_from_main_java.stem + ".txt")
+                absolute_processed_txt_path = self.processed_output_root / relative_processed_txt_path
+                
+                if not absolute_processed_txt_path.exists():
+                    print(f"  WARNING: Processed .txt file not found for {java_file_path.name}. Skipping.")
+                    continue
 
+                # Read the content from the *processed* .txt file for annotation detection
+                # This ensures comments are removed before checking for @Service/@Controller
+                cleaned_content = absolute_processed_txt_path.read_text(encoding='utf-8')
+                is_service = self.service_annotation_pattern.search(cleaned_content)
+                is_controller = self.controller_annotation_pattern.search(cleaned_content)
+
+                # Filter here: Only process if it's explicitly a Service or Controller based on cleaned content
                 if is_service or is_controller:
-                    print(f"  Found Spring Boot target: {java_file_path.name}")
                     
-                    analysis_result = self.code_analyser.analyze_dependencies(java_file_path)
+                    analysis_result = self.code_analyser.analyze_dependencies(java_file_path) # analyze_dependencies uses original .java for imports
                     class_name = analysis_result["class_name"]
                     package_name = analysis_result["package_name"]
                     dependent_filenames = analysis_result["dependent_filenames"]
 
-                    relative_path_from_main_java = java_file_path.relative_to(self.project_main_java_dir)
-                    relative_processed_txt_path = relative_path_from_main_java.parent / (relative_path_from_main_java.stem + ".txt")
-                    
-                    absolute_processed_txt_path = self.processed_output_root / relative_processed_txt_path
                     custom_imports = extract_custom_imports_from_chunk_file(absolute_processed_txt_path)
 
+                    # Determine the type
+                    target_type = "Controller" if is_controller else "Service"
+                    
+                    # Detect DB dependency using the helper function on original content (for richer context)
+                    # We use java_file_path.read_text() here to get the full context for DB detection regexes
+                    # which might look for specific injection patterns etc.
+                    original_java_content = java_file_path.read_text(encoding='utf-8')
+                    requires_db_test = self.code_analyser._detect_db_dependency_in_content(original_java_content, class_name)
 
+
+                    print(f"  Found {target_type} target: {java_file_path.name}") # Explicitly print type
                     discovered_targets.append({
-                        "java_file_path_abs": java_file_path,
+                        "java_file_path_abs": str(java_file_path), # Convert Path to string for JSON serialization
                         "relative_processed_txt_path": str(relative_processed_txt_path),
                         "class_name": class_name,
                         "package_name": package_name,
                         "dependent_filenames": dependent_filenames,
-                        "custom_imports": custom_imports
+                        "custom_imports": custom_imports,
+                        "type": target_type, # Add the determined type
+                        "requires_db_test": requires_db_test # Add the DB dependency flag
                     })
             except Exception as e:
                 print(f"  Error processing file {java_file_path}: {e}")
         
-        print(f"Finished scanning. Discovered {len(discovered_targets)} Spring Boot targets.")
+        print(f"Finished scanning. Discovered {len(discovered_targets)} Spring Boot targets (Services/Controllers).")
         return discovered_targets
 

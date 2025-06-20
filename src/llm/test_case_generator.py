@@ -275,6 +275,11 @@ Here is the relevant code context from the project, retrieved from the vector da
                         for msg in general_msgs:
                             detailed_feedback += f"  - {msg}\n"
                 
+                # --- NEW DEBUGGING PRINTS ---
+                print("\n--- DETAILED ERROR FEEDBACK SENT TO LLM (for debugging) ---")
+                print(detailed_feedback)
+                print("\n--- COMPLETE ERROR FEEDBACK MESSAGE SENT TO LLM (for debugging) ---")
+                # Also print the full message for complete context
                 error_feedback_message = (
                     "\n\n--- PREVIOUS ATTEMPT FEEDBACK ---\n"
                     f"The previously generated test for `{target_class_name}` encountered the following issue:\n"
@@ -287,6 +292,10 @@ Here is the relevant code context from the project, retrieved from the vector da
                     f"Ensure you still adhere to all original instructions (Mockito usage, coverage, imports, etc.)."
                     f"\n--- END PREVIOUS ATTEMPT FEEDBACK ---\n"
                 )
+                print(error_feedback_message)
+                print("\n--------------------------------------------------------------")
+                # --- END NEW DEBUGGING PRINTS ---
+
                 # Modify the template to include feedback
                 template_with_feedback = base_template + error_feedback_message 
                 QA_CHAIN_PROMPT = PromptTemplate.from_template(template_with_feedback)
