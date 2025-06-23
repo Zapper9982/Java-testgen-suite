@@ -39,6 +39,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 import torch 
+from llm import test_prompt_templates
 
 
 # --- Google API Configuration ---
@@ -175,70 +176,46 @@ class TestCaseGenerator:
             self.qa_chain.retriever = self.retriever
         print(f"Retriever filter updated to target filenames: '{filter_filenames}'")
 
-    def _get_unit_test_prompt_template(self, target_class_name: str, target_package_name: str, custom_imports: List[str], additional_query_instructions: str, requires_db_test: bool = False) -> str:
-        """
-        Constructs the prompt template for unit test generation using Mockito.
-        The `requires_db_test` flag guides how database-related dependencies should be mocked.
-        """
-        formatted_custom_imports = "\n".join(custom_imports)
-        
-        db_mocking_instruction = ""
-        if requires_db_test:
-            db_mocking_instruction = """
-5.  Since this class typically interacts with a database (e.g., through a Repository or Service that uses a DB), **you MUST mock all database interactions.** For any injected repositories (e.g., `SomeRepository`), use Mockito to stub their methods (`when(mockRepository.save(any())).thenReturn(...)`, `when(mockRepository.findById(any())).thenReturn(...)`). Do NOT attempt to connect to a real database. Focus on testing the business logic based on mocked database responses.
-"""
-        return f"""
-As an expert Java developer and Spring Boot testing specialist, your task is to generate a comprehensive JUnit 5 **unit test** class for the `{target_class_name}` class.
-**Crucially, follow these rules for the test class structure and Mockito setup:**
-1.  Use `@ExtendWith(MockitoExtension.class)` for JUnit 5.
-2.  Declare dependencies that need to be mocked with `@Mock`.
-3.  Declare the class under test with `@InjectMocks`.
-4.  **VERY IMPORTANT for internal method stubbing on the class under test:** If `{target_class_name}` has methods that call other methods *within itself* that need to be stubbed for testing (e.g., to prevent real side effects or complex logic during a test of an outer method), then also annotate the `@InjectMocks` field with `@Spy`.
-5.  When stubbing methods on a `@Spy` object (the `@InjectMocks` instance), **ALWAYS use `doReturn(value).when(spyObject).method()` or `doNothing().when(spyObject).voidMethod()` syntax.**
-    * **DO NOT use `when(spyObject.method()).thenReturn(value)` for `@Spy` objects. This is the common cause of `MissingMethodInvocation` errors.**
-6.  **Mockito Limitations - CRITICAL:** Be aware that Mockito cannot directly stub `private`, `static`, or `final` methods on a `@Spy` object without advanced (and often discouraged) configurations like PowerMock.
-    * If a method is `private`, `static`, or `final`, **DO NOT attempt to stub it directly using Mockito.**
-    * Instead, focus on testing the *public* methods that call these unmockable internal methods. Verify the *overall behavior* or *side effects* (e.g., interactions with other mocks, return values from the public method) rather than trying to mock the internal call itself.
-{db_mocking_instruction}
-7.  Ensure tests are **deterministic**, cover all public methods, and aim for **100% JaCoCo coverage**.
-8.  Use **Assertions** to validate outcomes, including for void functions (e.g., `verify` interactions).
-9.  Exclude `DataTypeConverters`.
-10. Ensure all necessary imports are included, especially from the target class's package and the `com.iemr` internal dependencies.
+    def _detect_test_type(self, target_info: Dict[str, Any]) -> str:
+        ttype = target_info.get('type', '').lower()
+        if 'controller' in ttype:
+            return 'controller'
+        elif 'service' in ttype:
+            return 'service'
+        elif 'repository' in ttype:
+            return 'repository'
+        return 'service'  # Default fallback
 
-Here are the relevant imports from the original source file that you may need to consider:
-{formatted_custom_imports}
+    def _get_prompt_template(self, test_type: str, target_class_name: str, target_package_name: str, custom_imports: list, additional_query_instructions: str, dependency_signatures: dict = None) -> str:
+        if test_type == 'controller':
+            return test_prompt_templates.get_controller_test_prompt_template(
+                target_class_name, target_package_name, custom_imports, additional_query_instructions, dependency_signatures
+            )
+        elif test_type == 'repository':
+            return test_prompt_templates.get_repository_test_prompt_template(
+                target_class_name, target_package_name, custom_imports, additional_query_instructions, dependency_signatures
+            )
+        else:
+            return test_prompt_templates.get_service_test_prompt_template(
+                target_class_name, target_package_name, custom_imports, additional_query_instructions, dependency_signatures
+            )
 
-Please import the target class using: `import {target_package_name}.{target_class_name};`
-{additional_query_instructions}
-
-Provide ONLY the complete Java code block for the test class. Do NOT include any conversational text, explanations, or extraneous characters outside the code block.
-
-Here is the relevant code context from the project, retrieved from the vector database:
-
-```java
-{{context}}
-// Begin generated test code
-"""
-    
     def generate_test_case(self, 
                            target_class_name: str, 
                            target_package_name: str, 
                            custom_imports: List[str],
                            relevant_java_files_for_context: List[str],
-                           test_output_file_path: Path, # Added to save generated code
+                           test_output_file_path: Path, 
                            additional_query_instructions: str,
-                           requires_db_test: bool) -> str: # Keep requires_db_test to inform mocking
-        """
-        Generates a JUnit 5 unit test case by querying the RetrievalQA chain,
-        with a dynamically constructed prompt, and includes a feedback loop for corrections.
-        """
-        # Update retriever filter for the current test case
+                           requires_db_test: bool,
+                           dependency_signatures: Dict[str, str] = None,
+                           target_info: Dict[str, Any] = None) -> str:
         self._update_retriever_filter(relevant_java_files_for_context)
-
-        print(f"Generating UNIT test for {target_class_name} (Database mocking: {requires_db_test}).")
-        base_template = self._get_unit_test_prompt_template(
-            target_class_name, target_package_name, custom_imports, 
-            additional_query_instructions, requires_db_test=requires_db_test # Pass the flag
+        test_type = self._detect_test_type(target_info or {})
+        print(f"Generating {test_type.upper()} test for {target_class_name}...")
+        base_template = self._get_prompt_template(
+            test_type, target_class_name, target_package_name, custom_imports,
+            additional_query_instructions, dependency_signatures
         )
 
         generated_code = ""
@@ -446,7 +423,9 @@ if __name__ == "__main__":
                 relevant_java_files_for_context=relevant_java_files_for_context,
                 test_output_file_path=test_output_file_path, # Pass the output path
                 additional_query_instructions="and make sure there are no errors, and you don't cause mismatch in return types and stuff.",
-                requires_db_test=requires_db_test # Pass the flag to the prompt template
+                requires_db_test=requires_db_test, # Pass the flag to the prompt template
+                dependency_signatures=None, # Pass None for now, as dependency_signatures are not provided in the input
+                target_info=target_info # Pass the target_info for test type detection
             )
             
             os.makedirs(test_output_dir, exist_ok=True)
