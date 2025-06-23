@@ -178,3 +178,31 @@ class SpringBootAnalyser:
         print(f"Finished scanning. Discovered {len(discovered_targets)} Spring Boot targets (Services/Controllers).")
         return discovered_targets
 
+def resolve_transitive_dependencies(java_file_path: Path, project_main_java_dir: Path) -> List[str]:
+    """
+    Recursively resolve all transitive dependencies (filenames) for a given Java file.
+    Returns a unique list of all .java filenames (including the target file itself).
+    """
+    visited = set()
+    to_visit = [java_file_path]
+    all_filenames = set()
+    analyser = CodeAnalyser(project_main_java_dir)
+
+    while to_visit:
+        current_path = to_visit.pop()
+        if not current_path.exists() or current_path in visited:
+            continue
+        visited.add(current_path)
+        analysis = analyser.analyze_dependencies(current_path)
+        filename = current_path.name
+        all_filenames.add(filename)
+        for dep_filename in analysis.get('dependent_filenames', []):
+            dep_path = None
+            # Try to find the dependency file in the project
+            for found in project_main_java_dir.rglob(dep_filename):
+                dep_path = found
+                break
+            if dep_path and dep_path not in visited:
+                to_visit.append(dep_path)
+    return sorted(all_filenames)
+

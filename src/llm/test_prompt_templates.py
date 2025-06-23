@@ -1,5 +1,43 @@
 """
 Ultra-strict prompt templates for LLM-based test generation for Spring Boot (JUnit5 + Mockito + MockMvc).
+Includes few-shot positive and negative examples, and strict output instructions.
+"""
+
+# --- FEW-SHOT EXAMPLES (used in all templates) ---
+POSITIVE_EXAMPLE = '''
+// GOOD EXAMPLE (do this):
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.InjectMocks;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+import static org.mockito.Mockito.*;
+import static org.junit.jupiter.api.Assertions.*;
+
+@ExtendWith(MockitoExtension.class)
+class UserServiceTest {{
+    @Mock UserRepository userRepository;
+    @InjectMocks UserService userService;
+
+    @Test
+    void shouldReturnUser_whenUserExists() {{
+        User user = new User("alice");
+        when(userRepository.findByName("alice")).thenReturn(user);
+        User result = userService.findByName("alice");
+        assertEquals("alice", result.getName());
+    }}
+}}
+'''
+
+NEGATIVE_EXAMPLE = '''
+// BAD EXAMPLE (never do this):
+// import com.fake.NonExistent;
+// @Test void testFake() {{ fail(); }}
+// This test will not compile. Never invent imports or methods.
+'''
+
+STRICT_OUTPUT_INSTRUCTIONS = """
+Output ONLY a single compilable Java code block. If you cannot generate a test for any method, output a comment in the code explaining why. Never output explanations or text outside the code block.
 """
 
 def get_service_test_prompt_template(target_class_name, target_package_name, custom_imports, additional_query_instructions, dependency_signatures=None):
@@ -15,15 +53,19 @@ def get_service_test_prompt_template(target_class_name, target_package_name, cus
 You are an expert Senior Java Developer specializing in writing clean, maintainable, and robust unit tests for Spring Boot services using JUnit 5 and Mockito. Your code must be production-quality and must compile without errors.
 </persona>
 <task>
-Generate a comprehensive JUnit 5 unit test class for the `{target_class_name}` class in the `{target_package_name}` package.
+Generate a comprehensive JUnit 5 unit test class for the '{target_class_name}' class in the '{target_package_name}' package.
 </task>
+<examples>
+{POSITIVE_EXAMPLE}
+{NEGATIVE_EXAMPLE}
+</examples>
 <rules>
 <rule number="1" importance="critical">Output ONLY compilable Java code. Do NOT output explanations, comments, or text outside the code block.</rule>
 <rule number="2" importance="critical">Use only methods, fields, and dependencies that exist in the provided context. Never hallucinate methods, fields, or imports.</rule>
 <rule number="3" importance="critical">Use `@ExtendWith(MockitoExtension.class)` for JUnit 5.</rule>
 <rule number="4" importance="critical">Declare dependencies to be mocked with `@Mock`.</rule>
 <rule number="5" importance="critical">Declare the class under test with `@InjectMocks`.</rule>
-<rule number="6" importance="high">If `{target_class_name}` calls its own public methods that need stubbing, annotate `@InjectMocks` with `@Spy`.</rule>
+<rule number="6" importance="high">If '{target_class_name}' calls its own public methods that need stubbing, annotate `@InjectMocks` with `@Spy`.</rule>
 <rule number="7" importance="critical">When stubbing a `@Spy` object, ALWAYS use `doReturn(value).when(spyObject).method()` syntax. NEVER use `when(spyObject.method()).thenReturn(value)` for spies.</rule>
 <rule number="8" importance="critical">Never use undefined variables, ambiguous types, or TODOs. Never use methods or fields not present in the context.</rule>
 <rule number="9" importance="critical">Include all necessary imports. The target class is `import {target_package_name}.{target_class_name};`.</rule>
@@ -44,6 +86,7 @@ Generate a comprehensive JUnit 5 unit test class for the `{target_class_name}` c
 </context>
 <instructions>
 {additional_query_instructions}
+{STRICT_OUTPUT_INSTRUCTIONS}
 Provide ONLY the complete Java code block for the test class, enclosed in ```java ... ```.
 Do not include any explanations or conversational text.
 </instructions>
@@ -62,8 +105,12 @@ def get_controller_test_prompt_template(target_class_name, target_package_name, 
 You are an expert Senior Java Developer specializing in writing robust, isolated unit tests for Spring Boot REST controllers using JUnit 5, Mockito, and MockMvc. Your code must be production-quality and must compile without errors.
 </persona>
 <task>
-Generate a comprehensive JUnit 5 test class for the `{target_class_name}` controller in the `{target_package_name}` package. Use `@WebMvcTest({target_class_name}.class)` and `MockMvc` for endpoint testing.
+Generate a comprehensive JUnit 5 test class for the '{target_class_name}' controller in the '{target_package_name}' package. Use `@WebMvcTest({target_class_name}.class)` and `MockMvc` for endpoint testing.
 </task>
+<examples>
+{POSITIVE_EXAMPLE}
+{NEGATIVE_EXAMPLE}
+</examples>
 <rules>
 <rule number="1" importance="critical">Output ONLY compilable Java code. Do NOT output explanations, comments, or text outside the code block.</rule>
 <rule number="2" importance="critical">Use only methods, fields, and dependencies that exist in the provided context. Never hallucinate methods, fields, or imports.</rule>
@@ -90,6 +137,7 @@ Generate a comprehensive JUnit 5 test class for the `{target_class_name}` contro
 </context>
 <instructions>
 {additional_query_instructions}
+{STRICT_OUTPUT_INSTRUCTIONS}
 Provide ONLY the complete Java code block for the test class, enclosed in ```java ... ```.
 Do not include any explanations or conversational text.
 </instructions>
@@ -108,8 +156,12 @@ def get_repository_test_prompt_template(target_class_name, target_package_name, 
 You are an expert Senior Java Developer specializing in writing clean, maintainable, and robust unit tests for Spring Boot repositories using JUnit 5 and Mockito. Your code must be production-quality and must compile without errors.
 </persona>
 <task>
-Generate a comprehensive JUnit 5 unit test class for the `{target_class_name}` repository in the `{target_package_name}` package.
+Generate a comprehensive JUnit 5 unit test class for the '{target_class_name}' repository in the '{target_package_name}' package.
 </task>
+<examples>
+{POSITIVE_EXAMPLE}
+{NEGATIVE_EXAMPLE}
+</examples>
 <rules>
 <rule number="1" importance="critical">Output ONLY compilable Java code. Do NOT output explanations, comments, or text outside the code block.</rule>
 <rule number="2" importance="critical">Use only methods, fields, and dependencies that exist in the provided context. Never hallucinate methods, fields, or imports.</rule>
@@ -134,6 +186,7 @@ Generate a comprehensive JUnit 5 unit test class for the `{target_class_name}` r
 </context>
 <instructions>
 {additional_query_instructions}
+{STRICT_OUTPUT_INSTRUCTIONS}
 Provide ONLY the complete Java code block for the test class, enclosed in ```java ... ```.
 Do not include any explanations or conversational text.
 </instructions>

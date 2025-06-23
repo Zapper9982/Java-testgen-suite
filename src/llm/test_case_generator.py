@@ -29,12 +29,12 @@ if str(TESTGEN_AUTOMATION_SRC_DIR) not in sys.path:
     print(f"Added {TESTGEN_AUTOMATION_SRC_DIR} to sys.path for internal module imports.")
 
 # Import necessary utilities and the new JavaTestRunner
-from analyzer.code_analysis_utils import extract_custom_imports_from_chunk_file 
+from analyzer.code_analysis_utils import extract_custom_imports_from_chunk_file, resolve_transitive_dependencies
 from test_runner.java_test_runner import JavaTestRunner 
 
 from chroma_db.chroma_client import get_chroma_client, get_or_create_collection
 from langchain_community.vectorstores import Chroma
-from langchain_community.embeddings import HuggingFaceBgeEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
@@ -113,9 +113,8 @@ class TestCaseGenerator:
         print("Initializing TestCaseGenerator with LangChain components (Google Gemini LLM)...")
         
         print(f"Loading embedding model: {EMBEDDING_MODEL_NAME_BGE} on {DEVICE_FOR_EMBEDDINGS}...")
-        self.embeddings = HuggingFaceBgeEmbeddings(
-            model_name=EMBEDDING_MODEL_NAME_BGE, 
-            model_kwargs={'device': DEVICE_FOR_EMBEDDINGS},
+        self.embeddings = HuggingFaceEmbeddings(
+            model_name=EMBEDDING_MODEL_NAME_BGE,
             encode_kwargs={'normalize_embeddings': True}
         )
         print("Embedding model loaded.")
@@ -163,18 +162,28 @@ class TestCaseGenerator:
         else:
             filter_filenames = filenames 
 
-        # Using $in operator to filter by multiple filenames
+        # Always include test utility/config files
+        always_include = [
+            "BaseTest.java", "TestUtils.java", "application-test.yml", "application-test.properties"
+        ]
+        for util_file in always_include:
+            if util_file not in filter_filenames:
+                filter_filenames.append(util_file)
+
+        # Dynamically set k based on number of files
+        k = min(30, 5 + 2 * len(filter_filenames))
+
         self.retriever = self.vectorstore.as_retriever(
             search_type="mmr",
             search_kwargs={
-                "k": 15, # Still a TODO for dynamic adjustment, consider increasing if context is too small
+                "k": k,
                 "filter": {"filename": {"$in": filter_filenames}}
             },
         )
         # Update the QA chain with the new retriever if it's already initialized.
         if self.qa_chain:
             self.qa_chain.retriever = self.retriever
-        print(f"Retriever filter updated to target filenames: '{filter_filenames}'")
+        print(f"Retriever filter updated to target filenames: '{filter_filenames}' (k={k})")
 
     def _detect_test_type(self, target_info: Dict[str, Any]) -> str:
         ttype = target_info.get('type', '').lower()
@@ -396,9 +405,11 @@ if __name__ == "__main__":
             requires_db_test = target_info.get('requires_db_test', False) 
             target_class_type = target_info.get('type', 'Unknown') # Get class type (Controller/Service/Repository)
 
-
-            # Combine the target file's own filename with its identified dependencies for retrieval
-            relevant_java_files_for_context = [java_file_path_abs.name] + identified_dependencies_filenames
+            # --- NEW: Use transitive dependency resolution ---
+            relevant_java_files_for_context = resolve_transitive_dependencies(
+                java_file_path_abs, SPRING_BOOT_MAIN_JAVA_DIR
+            )
+            # Always include test utility/config files (handled in _update_retriever_filter)
             relevant_java_files_for_context = list(set(relevant_java_files_for_context)) # Ensure uniqueness
             
             # --- Prepare output paths ---
