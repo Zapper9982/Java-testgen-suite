@@ -19,7 +19,7 @@ class JavaTestRunner:
 
     def _parse_maven_errors(self, stdout: str, stderr: str) -> Dict[str, Any]:
         """
-        Parses Maven stdout/stderr for compilation errors and test failures.
+        Parses Maven stdout/stderr for compilation errors and test failures, providing structured details and fix suggestions.
         """
         errors = {
             "compilation_errors": [],
@@ -31,66 +31,127 @@ class JavaTestRunner:
         compilation_error_pattern = re.compile(
             r"\[ERROR\]\s*(.+?\.java):\[(\d+),(\d+)\]\s*(.+)"
         )
-        # Regex for more general compilation issues (e.g., [ERROR] COMPILATION ERROR :)
+        # Regex for cannot find symbol (extract symbol/class/method)
+        cannot_find_symbol_pattern = re.compile(r"symbol:\s*(\w+)\s*(\w+)?")
+        # Regex for missing import
+        missing_import_pattern = re.compile(r"package\s+([\w\.]+)\s+does\s+not\s+exist")
+        # Regex for incompatible types
+        incompatible_types_pattern = re.compile(r"incompatible types: (.+) cannot be converted to (.+)")
+        # Regex for more general compilation issues
         general_compilation_pattern = re.compile(
             r"\[ERROR\]\s*(.*(?:COMPILATION ERROR|error|symbol not found|package does not exist).*)", re.IGNORECASE
         )
-        # Regex for JUnit test failures (basic pattern)
-        test_failure_pattern = re.compile(
-            r"Tests run:.*?Failures:\s*(\d+).*?Errors:\s*(\d+).*?Skipped:\s*(\d+)"
-        )
-        # Regex for individual test failure details (common in Surefire/Failsafe reports section)
-        individual_test_failure_pattern = re.compile(
-            r"Tests in error:\s*\n(?:\s{4}[^\n]+\n)*?(?P<failures>(?:[a-zA-Z0-9_\.$]+\([a-zA-Z0-9_\.$]+\)\s*\n?)+)" # Catches multiple lines of failures
-            r"Tests run:.*?(?P<summary>Failures:\s*\d+,\s*Errors:\s*\d+,\s*Skipped:\s*\d+)" # Summary for context
-        )
+        # Regex for assertion errors
+        assertion_pattern = re.compile(r"expected:\s*(.+?)\s*but was:\s*(.+)", re.IGNORECASE)
         
-        # Check for compilation errors
+        # Check for compilation errors first (from both stdout and stderr)
         for line in (stdout + stderr).splitlines():
             match_comp_error = compilation_error_pattern.search(line)
             if match_comp_error:
+                file = match_comp_error.group(1)
+                line_num = int(match_comp_error.group(2))
+                column = int(match_comp_error.group(3))
+                message = match_comp_error.group(4).strip()
+                error_type = "COMPILATION_ERROR"
+                symbol = None
+                suggested_fix = None
+                # Detect specific error types and suggest fixes
+                if "cannot find symbol" in message:
+                    error_type = "CANNOT_FIND_SYMBOL"
+                    m = cannot_find_symbol_pattern.search(message)
+                    if m:
+                        symbol = m.group(2) or m.group(1)
+                        suggested_fix = f"Declare or import symbol '{symbol}'. Check for typos or missing dependencies."
+                    else:
+                        suggested_fix = "Declare or import the missing symbol."
+                elif "package" in message and "does not exist" in message:
+                    error_type = "MISSING_IMPORT"
+                    m = missing_import_pattern.search(message)
+                    if m:
+                        symbol = m.group(1)
+                        suggested_fix = f"Add import statement for package '{symbol}'."
+                    else:
+                        suggested_fix = "Add the missing import statement."
+                elif "incompatible types" in message:
+                    error_type = "INCOMPATIBLE_TYPES"
+                    m = incompatible_types_pattern.search(message)
+                    if m:
+                        from_type, to_type = m.groups()
+                        suggested_fix = f"Change the type from '{from_type}' to '{to_type}' or cast appropriately."
+                    else:
+                        suggested_fix = "Fix the type mismatch."
+                else:
+                    suggested_fix = "Read the error message and fix the code accordingly."
                 errors["compilation_errors"].append({
-                    "file": match_comp_error.group(1),
-                    "line": int(match_comp_error.group(2)),
-                    "column": int(match_comp_error.group(3)),
-                    "message": match_comp_error.group(4).strip()
+                    "file": file,
+                    "line": line_num,
+                    "column": column,
+                    "location": f"{file}:{line_num}:{column}",
+                    "message": message,
+                    "error_type": error_type,
+                    "symbol": symbol,
+                    "suggested_fix": suggested_fix
                 })
             else:
                 match_general_comp = general_compilation_pattern.search(line)
                 if match_general_comp:
-                    # Avoid duplicate if already caught by detailed pattern
                     if not any(match_general_comp.group(1) in e['message'] for e in errors["compilation_errors"]):
                         errors["general_messages"].append(match_general_comp.group(1).strip())
         
-        # Check for test failures
-        test_summary_match = test_failure_pattern.search(stdout)
-        if test_summary_match:
-            failures = int(test_summary_match.group(1))
-            errors_count = int(test_summary_match.group(2))
-            if failures > 0 or errors_count > 0:
-                errors["test_failures"].append({
-                    "summary": f"Total failures: {failures}, Total errors: {errors_count}",
-                    "details": []
-                })
-                # Attempt to find individual test failure details
-                individual_failures_match = individual_test_failure_pattern.search(stdout)
-                if individual_failures_match:
-                    failure_list_raw = individual_failures_match.group('failures').strip()
-                    for f_line in failure_list_raw.splitlines():
-                        f_line = f_line.strip()
-                        if f_line:
-                            errors["test_failures"][-1]["details"].append(f_line)
-                # Fallback to general message if specific details aren't found
-                elif "Failures:" in stdout and "Tests run:" in stdout:
-                     # Capture a window around the failures section
-                    failure_section_match = re.search(r"(?s)(---(.*?)TESTS.*?\n)(.*?)(^\[INFO\].*?Finished.*)", stdout)
-                    if failure_section_match:
-                        errors["test_failures"][-1]["details"].append("Relevant Test Output:\n" + failure_section_match.group(3).strip())
-                    
+        # Test failure parsing (extract method, class, type, message, stack, expected/actual, suggested fix)
+        test_failure_method_pattern = re.compile(r"\[ERROR\]\s+([\w.$]+)\(([\w.$]+)\)\s+Time elapsed:[\d.]+ s\s+<<< (?:FAILURE|ERROR)!?\s*\n(?P<exception_type>[a-zA-Z0-9_\.$]+(?:Exception|Error|Failure)?):?\s*(?P<message>.*?(?=\n\s+at|\n\s*\w+\.[\w.$]+:))", re.MULTILINE | re.DOTALL)
+        for match in test_failure_method_pattern.finditer(stdout):
+            test_method = match.group(1)
+            test_class = match.group(2)
+            failure_type = match.group('exception_type').strip()
+            message = match.group('message').strip()
+            expected = None
+            actual = None
+            suggested_fix = None
+            stack_trace = None
+            assertion_match = assertion_pattern.search(message)
+            if assertion_match:
+                expected = assertion_match.group(1).strip()
+                actual = assertion_match.group(2).strip()
+                suggested_fix = f"Check the assertion in '{test_method}'. Expected '{expected}', but got '{actual}'. Fix the test or the code under test."
+            elif "NullPointerException" in failure_type:
+                suggested_fix = f"A NullPointerException occurred in '{test_method}'. Ensure all mocks are properly stubbed and no object is null before use."
+            elif "MockitoException" in failure_type:
+                suggested_fix = f"A Mockito error occurred in '{test_method}'. Check your mock setup, especially for @Spy and argument matchers."
+            elif "AssertionFailedError" in failure_type:
+                suggested_fix = f"An assertion failed in '{test_method}'. Check the expected and actual values and update the test or code."
+            else:
+                suggested_fix = f"A test failure occurred in '{test_method}'. Read the error message and fix the test or code."
+            # Try to extract stack trace (lines after the error message)
+            stack_trace_lines = []
+            lines = stdout.splitlines()
+            start_idx = None
+            for i, l in enumerate(lines):
+                if test_method in l and failure_type in l:
+                    start_idx = i + 1
+                    break
+            if start_idx is not None:
+                for l in lines[start_idx:]:
+                    if l.strip().startswith('at '):
+                        stack_trace_lines.append(l.strip())
+                    else:
+                        break
+                if stack_trace_lines:
+                    stack_trace = '\n'.join(stack_trace_lines)
+            errors["test_failures"].append({
+                "test_class": test_class,
+                "test_method": test_method,
+                "failure_type": failure_type,
+                "message": message,
+                "expected": expected,
+                "actual": actual,
+                "stack_trace": stack_trace,
+                "location": f"{test_class}.{test_method}",
+                "suggested_fix": suggested_fix
+            })
+        # (General messages unchanged)
         if not errors["compilation_errors"] and not errors["test_failures"] and not errors["general_messages"] and ("BUILD FAILURE" in stdout or "BUILD ERROR" in stdout):
-            # Catch cases where build failed but no specific parsing happened
             errors["general_messages"].append("Maven build failed for an unparsed reason. Full output might be needed.")
-
         return errors
 
 
@@ -115,7 +176,7 @@ class JavaTestRunner:
 
             status = "UNKNOWN"
             message = "An unexpected Maven execution state occurred."
-            
+
             if return_code == 0 and "BUILD SUCCESS" in stdout:
                 # Look for test results summary (common in Maven output)
                 test_summary_match = re.search(r"Tests run: (\d+), Failures: (\d+), Errors: (\d+), Skipped: (\d+)", stdout)
@@ -201,7 +262,7 @@ class JavaTestRunner:
                 "general_messages": []
             }
             if "BUILD FAILED" in stdout or "BUILD FAILED" in stderr:
-                detailed_errors["general_messages"].append("Gradle build failed. Check stdout/stderr for details.")
+                    detailed_errors["general_messages"].append("Gradle build failed. Check stdout/stderr for details.")
                 # You can add regex here later to parse specific Gradle errors.
             
             status = "UNKNOWN"
