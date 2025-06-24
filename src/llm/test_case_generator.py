@@ -50,7 +50,7 @@ if not GOOGLE_API_KEY:
     print("Example: export GOOGLE_API_KEY='your_google_api_key_here'")
 
 # LLM model definition - Using Gemini 1.5 Flash for potentially better rate limits and speed
-LLM_MODEL_NAME_GEMINI = "gemini-2.0-flash" 
+LLM_MODEL_NAME_GEMINI = "gemini-2.5-flash" 
 
 EMBEDDING_MODEL_NAME_BGE = "BAAI/bge-small-en-v1.5"
 # Use 'mps' for Apple Silicon (M1/M2/M3 chips) if available, otherwise 'cpu'
@@ -270,6 +270,13 @@ Do NOT invent or omit any methods. Output a JSON array like:
         if hasattr(result, "content"):
             result = result.content
         print("\n--- DEBUG: TEST PLAN OUTPUT ---\n" + result + "\n--- END TEST PLAN OUTPUT ---\n")
+        # --- PATCH: Strip code block markers before JSON parsing ---
+        result = result.strip()
+        # Remove triple backticks and optional language label (e.g., ```json or ```java)
+        result = re.sub(r'^```[a-zA-Z]*\n', '', result)
+        result = re.sub(r'^```', '', result)
+        result = re.sub(r'```$', '', result)
+        result = result.strip()
         # Try to parse as JSON
         try:
             test_cases = json.loads(result)
@@ -387,6 +394,56 @@ STRICT REQUIREMENTS:
         # Otherwise, reject
         return None
 
+    def generate_whole_class_test(self, target_class_name: str, target_package_name: str, class_code: str, public_methods: list, custom_imports: list) -> str:
+        """
+        Prompts the LLM to generate a complete JUnit test class for the given class code.
+        Strictly instructs the LLM to cover all public methods and avoid unnecessary stubbing/mocking.
+        """
+        method_list_str = '\n'.join(f'- {m}' for m in public_methods)
+        imports_section = '\n'.join(custom_imports) if custom_imports else ''
+        prompt = f"""
+You are an expert Java developer. Given the following class, generate a complete JUnit 5 + Mockito test class that tests ALL public methods.
+- Include all necessary imports and annotations.
+- Name the test class {target_class_name}Test and use the package {target_package_name}.
+- Cover ALL of these public methods (do not skip any):\n{method_list_str}
+- Avoid unnecessary stubbing or mocking. Only mock what is required for compilation or to isolate the class under test. Do NOT mock dependencies that are not used in the test method. Do NOT mock simple POJOs or value objects.
+- Do NOT output explanations, markdown, or comments outside the code.
+- Output ONLY the Java code for the test class, nothing else.
+- Use these imports if needed (but do NOT output import statements if not needed):\n{imports_section}
+
+--- BEGIN CLASS UNDER TEST ---\n{class_code}\n--- END CLASS UNDER TEST ---
+"""
+        print("\n--- WHOLE-CLASS TEST GENERATION PROMPT ---\n" + prompt + "\n--- END WHOLE-CLASS TEST GENERATION PROMPT ---\n")
+        result = self.llm.invoke(prompt)
+        if hasattr(result, "content"):
+            result = result.content
+        print("\n--- RAW LLM WHOLE-CLASS OUTPUT ---\n" + result[:1000] + ("..." if len(result) > 1000 else "") + "\n--- END RAW LLM WHOLE-CLASS OUTPUT ---\n")
+        return result.strip()
+
+    def run_static_analysis(self, test_file_path: Path) -> dict:
+        """
+        Run Checkstyle (or other static analysis) on the generated test file and parse output.
+        Returns a dict with 'errors' (list of messages).
+        """
+        # You can expand this to SpotBugs, Error Prone, etc.
+        checkstyle_jar = os.getenv("CHECKSTYLE_JAR_PATH", "checkstyle-10.12.1-all.jar")
+        checkstyle_config = os.getenv("CHECKSTYLE_CONFIG", "google_checks.xml")
+        if not os.path.exists(checkstyle_jar) or not os.path.exists(checkstyle_config):
+            print("[STATIC ANALYSIS] Checkstyle jar or config not found, skipping static analysis.")
+            return {"errors": []}
+        cmd = f"java -jar {checkstyle_jar} -c {checkstyle_config} {test_file_path}"
+        try:
+            import subprocess
+            result = subprocess.run(cmd.split(), capture_output=True, text=True)
+            errors = []
+            for line in result.stdout.splitlines():
+                if ": error:" in line:
+                    errors.append(line.strip())
+            return {"errors": errors}
+        except Exception as e:
+            print(f"[STATIC ANALYSIS] Exception running Checkstyle: {e}")
+            return {"errors": []}
+
     def generate_test_case(self, 
                            target_class_name: str, 
                            target_package_name: str, 
@@ -397,176 +454,128 @@ STRICT REQUIREMENTS:
                            requires_db_test: bool,
                            dependency_signatures: Dict[str, str] = None,
                            target_info: Dict[str, Any] = None) -> str:
-        # --- Two-step approach for service/controller/repository ---
-        test_type = self._detect_test_type(target_info or {})
-        # --- NEW: Union dependency-based and import-based retrieval ---
-        all_imports = target_info.get('all_imports', []) if target_info else []
-        project_base_package = "com.iemr"  # Change if your base package is different
-        imported_project_files = []
-        import_re = re.compile(r'import\s+(' + re.escape(project_base_package) + r'\.[\w\.]+)\.(\w+);')
-        for imp in all_imports:
-            m = import_re.match(imp)
-            if m:
-                class_name = m.group(2)
-                imported_project_files.append(f"{class_name}.java")
-        # Union with dependency-based retrieval
-        relevant_java_files_for_context = list(set(relevant_java_files_for_context) | set(imported_project_files))
-        if test_type in ("service", "controller", "repository"):
-            self._update_retriever_filter(relevant_java_files_for_context, k_override=10)
-            retrieved_docs = self.retriever.get_relevant_documents(f"Full code for {target_class_name}")
-            class_code = "\n\n".join([doc.page_content for doc in retrieved_docs if target_class_name in doc.page_content])
-            if not class_code:
-                class_code = "\n\n".join([doc.page_content for doc in retrieved_docs])
-
-            # --- Test Plan Generation with Validation, Retry, and Auto-correction ---
-            max_test_plan_retries = 3
-            real_methods = sorted(self.extract_public_methods(class_code))
-            test_plan = []
-            for plan_attempt in range(max_test_plan_retries):
-                test_plan = self.generate_test_plan(target_class_name, class_code, real_methods=real_methods)
-                if not test_plan:
-                    print("[ERROR] LLM did not return a valid test plan. Aborting test generation.")
-                    return ""
-                plan_methods = self.extract_test_plan_methods(test_plan)
-                missing_methods = set(real_methods) - plan_methods
-                hallucinated_methods = plan_methods - set(real_methods)
-                # Auto-correct: add missing, remove hallucinated
-                if missing_methods or hallucinated_methods:
-                    print(f"[VALIDATION] Test plan mismatch. Missing methods: {missing_methods}, Hallucinated methods: {hallucinated_methods}")
-                    # Remove hallucinated
-                    test_plan = [tc for tc in test_plan if tc['method_name'] in real_methods]
-                    # Add missing with placeholder
-                    for m in missing_methods:
-                        test_plan.append({"method_name": m, "description": "No description provided (auto-added)."})
-                    # Sort to match real_methods order
-                    test_plan = sorted(test_plan, key=lambda x: real_methods.index(x['method_name']))
-                if not missing_methods and not hallucinated_methods:
-                    break  # Test plan is valid
-                print("[VALIDATION] Auto-corrected test plan. Retrying if needed...")
-                # If last retry, just use the auto-corrected plan
-                if plan_attempt == max_test_plan_retries - 1:
-                    print("[VALIDATION] Using auto-corrected test plan after retries.")
-            # --- If LLM still fails, fallback to per-method prompting ---
-            if not test_plan or len(test_plan) != len(real_methods):
-                print("[FALLBACK] LLM failed to generate a valid test plan. Using per-method prompting.")
-                test_plan = []
-                for m in real_methods:
-                    per_method_prompt = f"""
-You are an expert Java test designer. For the method '{m}' in the following class, provide a one-sentence description of what you would test (including edge cases, exceptions, etc.).
-
---- BEGIN CLASS UNDER TEST ---
-{class_code}
---- END CLASS UNDER TEST ---
-Output only the description, no code or method name.
-"""
-                    result = self.llm.invoke(per_method_prompt)
-                    if hasattr(result, "content"):
-                        result = result.content
-                    description = result.strip().splitlines()[0] if result.strip() else "No description provided."
-                    test_plan.append({"method_name": m, "description": description})
-            # --- Continue as before with validated test_plan ---
-            test_methods = []
-            method_errors = {}
-            for test_case in test_plan:
-                error_feedback = None
-                for attempt in range(MAX_TEST_GENERATION_RETRIES):
-                    method_codes = self.generate_test_method(target_class_name, class_code, test_case, custom_imports, test_type, error_feedback=error_feedback)
-                    # method_codes is now a list of methods
-                    # Assemble a temporary test class with all previous methods + these
-                    imports_section = '\n'.join(custom_imports) if custom_imports else ''
-                    temp_test_class_code = f"""
-package {target_package_name};
-
-{imports_section}
-import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.extension.ExtendWith;
-import org.mockito.InjectMocks;
-import org.mockito.Mock;
-import org.mockito.junit.jupiter.MockitoExtension;
-import static org.mockito.Mockito.*;
-import static org.junit.jupiter.api.Assertions.*;
-
-@ExtendWith(MockitoExtension.class)
-class {target_class_name}Test {{
-{chr(10).join(test_methods + method_codes)}
-}}
-"""
-                    # Write to file and try to compile/run
-                    os.makedirs(test_output_file_path.parent, exist_ok=True)
+        self._update_retriever_filter(relevant_java_files_for_context, k_override=10)
+        retrieved_docs = self.retriever.get_relevant_documents(f"Full code for {target_class_name}")
+        class_code = "\n\n".join([doc.page_content for doc in retrieved_docs if target_class_name in doc.page_content])
+        if not class_code:
+            class_code = "\n\n".join([doc.page_content for doc in retrieved_docs])
+        public_methods = sorted(self.extract_public_methods(class_code))
+        # --- Test Plan Validation ---
+        test_plan = self.generate_test_plan(target_class_name, class_code)
+        plan_methods = [tc['method_name'] for tc in test_plan]
+        real_methods = sorted(public_methods)
+        retries = 0
+        while set(plan_methods) != set(real_methods) and retries < 3:
+            print(f"[TEST PLAN VALIDATION] Mismatch between LLM plan and real methods. Retrying with strict feedback.")
+            print(f"  LLM plan methods: {plan_methods}")
+            print(f"  Static analysis methods: {real_methods}")
+            # Always use the full static analysis method list for the retry prompt
+            test_plan = self.generate_test_plan(target_class_name, class_code, real_methods)
+            plan_methods = [tc['method_name'] for tc in test_plan]
+            retries += 1
+        # Use real_methods if LLM keeps failing
+        if set(plan_methods) != set(real_methods):
+            print(f"[TEST PLAN VALIDATION] LLM failed to match real method list after retries. Using static analysis list.")
+            print(f"  LLM plan methods: {plan_methods}")
+            print(f"  Static analysis methods: {real_methods}")
+            plan_methods = real_methods
+            test_plan = [{"method_name": m, "description": f"Test for {m}"} for m in real_methods]
+        # --- Large Class Handling ---
+        max_methods_per_group = 5
+        method_groups = [plan_methods[i:i+max_methods_per_group] for i in range(0, len(plan_methods), max_methods_per_group)]
+        all_test_class_outputs = []
+        for group in method_groups:
+            group_methods = [tc for tc in test_plan if tc['method_name'] in group]
+            # --- Prompt Engineering: Add anti-mocking, anti-hallucination, and examples ---
+            anti_hallucination = "Do NOT invent methods, do NOT mock POJOs/value objects, only mock what is required for compilation or isolation. BAD: Mocks unused dependencies. GOOD: Only mocks required dependencies. If unsure, prefer not to mock. INCLUDE ALL PUBLIC METHODS, INCLUDING STATIC METHODS."
+            positive_example = "// GOOD: Only mocks required dependencies, covers all public and static methods."
+            negative_example = "// BAD: Mocks unused dependencies, skips methods, causes build to fail."
+            prompt_instructions = f"{additional_query_instructions}\n{anti_hallucination}\n{positive_example}\n{negative_example}"
+            # --- Whole-class test generation for the group ---
+            group_test_code = self.generate_whole_class_test(target_class_name, target_package_name, class_code, group, custom_imports)
+            # --- Strip code block markers from LLM output before writing ---
+            group_test_code = group_test_code.strip()
+            import re
+            group_test_code = re.sub(r'^```[a-zA-Z]*\n', '', group_test_code)
+            group_test_code = re.sub(r'^```', '', group_test_code)
+            group_test_code = re.sub(r'```$', '', group_test_code)
+            group_test_code = group_test_code.strip()
+            # --- Feedback Loop: Compilation, Test, Static Analysis ---
+            error_feedback = None
+            max_retries = 5
+            last_valid_code = None
+            for attempt in range(max_retries):
+                if error_feedback and attempt > 0:
+                    # Re-prompt LLM with error feedback, but do NOT append error feedback to code
+                    group_test_code = self.generate_whole_class_test(target_class_name, target_package_name, class_code, group, custom_imports)
+                    group_test_code = group_test_code.strip()
+                    group_test_code = re.sub(r'^```[a-zA-Z]*\n', '', group_test_code)
+                    group_test_code = re.sub(r'^```', '', group_test_code)
+                    group_test_code = re.sub(r'```$', '', group_test_code)
+                    group_test_code = group_test_code.strip()
+                abs_path = os.path.abspath(test_output_file_path)
+                print(f"[DEBUG] About to write GROUP test to: {abs_path}")
+                try:
                     with open(test_output_file_path, 'w', encoding='utf-8') as f:
-                        f.write(temp_test_class_code)
-                    test_run_results = self.java_test_runner.run_test(test_output_file_path)
-                    if test_run_results["status"] == "SUCCESS":
-                        test_methods.extend(method_codes)
-                        break
-                    else:
-                        # Prepare error feedback for next attempt
-                        detailed_feedback = ""
-                        if test_run_results.get('detailed_errors'):
-                            comp_errors = test_run_results['detailed_errors'].get('compilation_errors', [])
-                            test_failures = test_run_results['detailed_errors'].get('test_failures', [])
-                            general_msgs = test_run_results['detailed_errors'].get('general_messages', [])
-                            if comp_errors:
-                                detailed_feedback += "\n--- COMPILATION ERRORS ---\n"
-                                for err in comp_errors:
-                                    detailed_feedback += f"File: {str(err.get('file', 'N/A'))}, Line: {str(err.get('line', 'N/A'))}, Col: {str(err.get('column', 'N/A'))}, Message: {str(err.get('message', 'N/A'))}\n"
-                            if test_failures:
-                                detailed_feedback += "\n--- TEST FAILURES ---\n"
-                                for failure in test_failures:
-                                    detailed_feedback += f"Summary: {str(failure.get('summary', 'N/A'))}\n"
-                                    for detail in failure.get('details', []):
-                                        detailed_feedback += f"  - {str(detail)}\n"
-                            if general_msgs:
-                                detailed_feedback += "\n--- GENERAL BUILD MESSAGES ---\n"
-                                for msg in general_msgs:
-                                    detailed_feedback += f"  - {str(msg)}\n"
-                        stdout_content = test_run_results.get('stdout', '')
-                        stderr_content = test_run_results.get('stderr', '')
-                        error_feedback = (
-                            f"Status: {test_run_results.get('status', 'N/A')}\n"
-                            f"Message: {test_run_results.get('message', 'N/A')}\n"
-                            f"{detailed_feedback}"
-                            f"Full STDOUT (truncated):\n{stdout_content[:2000]}...\n"
-                            f"Full STDERR (truncated):\n{stderr_content[:2000]}...\n"
-                            "Please revise the test method to fix these errors."
-                        )
-                        print(f"\n--- DEBUG: ERROR FEEDBACK FOR {test_case['method_name']} (Attempt {attempt+1}) ---\n{error_feedback}\n--- END ERROR FEEDBACK ---\n")
-                        if attempt == MAX_TEST_GENERATION_RETRIES - 1:
-                            print(f"[ERROR] Failed to generate a passing test method for {test_case['method_name']} after {MAX_TEST_GENERATION_RETRIES} attempts.")
-                            test_methods.extend(method_codes)  # Save the last attempt anyway
-            # Step 3: Assemble the final test class
-            test_class_code = self.assemble_test_class(target_package_name, custom_imports, target_class_name, test_methods, class_code)
-            # Write the generated test class to file (overwrite, not append)
-            with open(test_output_file_path, 'w', encoding='utf-8') as f:
-                f.write(test_class_code)
-            print(f"[TWO-STEP] Generated test class saved to: '{test_output_file_path}'")
-            print("\n--- FINAL GENERATED TEST CLASS (Two-Step) ---\n" + test_class_code + "\n" + "="*80 + "\n")
-            # Run the generated test as before
-            test_run_results = self.java_test_runner.run_test(test_output_file_path)
-            self.last_test_run_results = test_run_results
-            if test_run_results["status"] == "SUCCESS":
-                print(f"Test for {target_class_name} PASSED (two-step approach).")
-                return test_class_code
+                        f.write(group_test_code)
+                    print(f"[DEBUG] Successfully wrote GROUP test to {abs_path} (length: {len(group_test_code)})")
+                except Exception as e:
+                    print(f"[ERROR] Failed to write GROUP test to {abs_path}: {e}")
+                # Run compilation and tests
+                test_run_results = self.java_test_runner.run_test(test_output_file_path)
+                compilation_errors = test_run_results['detailed_errors'].get('compilation_errors', [])
+                test_failures = test_run_results['detailed_errors'].get('test_failures', [])
+                # Run static analysis
+                static_analysis = self.run_static_analysis(test_output_file_path)
+                static_errors = static_analysis['errors']
+                if not compilation_errors and not test_failures and not static_errors:
+                    print(f"[SUCCESS] No compilation, test, or static analysis errors after {attempt+1} attempt(s).")
+                    last_valid_code = group_test_code
+                    break
+                else:
+                    error_msgs = []
+                    if compilation_errors:
+                        print(f"[COMPILATION ERROR] Detected after attempt {attempt+1}:")
+                        for err in compilation_errors:
+                            print(f"  - {err['message']} (at {err['location']})")
+                            error_msgs.append(f"COMPILATION: {err['message']} (at {err['location']})")
+                    if test_failures:
+                        print(f"[TEST FAILURE] Detected after attempt {attempt+1}:")
+                        for err in test_failures:
+                            print(f"  - {err['message']} (in {err['location']})")
+                            error_msgs.append(f"TEST: {err['message']} (in {err['location']})")
+                    if static_errors:
+                        print(f"[STATIC ANALYSIS ERROR] Detected after attempt {attempt+1}:")
+                        for err in static_errors:
+                            print(f"  - {err}")
+                            error_msgs.append(f"STATIC: {err}")
+                    error_feedback = '\n'.join(error_msgs)
+            # After retries, only write valid code or a single error comment
+            if last_valid_code:
+                all_test_class_outputs.append(last_valid_code)
             else:
-                print(f"Test for {target_class_name} FAILED/ERRORED (two-step approach). Message: {test_run_results['message']}")
-                print("\n--- FULL STDOUT from Maven execution (for debugging) ---")
-                print(test_run_results.get('stdout', '[No stdout available]'))
-                print("\n--- FULL STDERR from Maven execution (for debugging) ---")
-                print(test_run_results.get('stderr', '[No stderr available]'))
-                print("[TWO-STEP] Final test class still has errors after all retries.")
-                return test_class_code
-        # --- fallback: original approach for other types ---
-        return super().generate_test_case(
-            target_class_name=target_class_name,
-            target_package_name=target_package_name,
-            custom_imports=custom_imports,
-            relevant_java_files_for_context=relevant_java_files_for_context,
-            test_output_file_path=test_output_file_path,
-            additional_query_instructions=additional_query_instructions,
-            requires_db_test=requires_db_test,
-            dependency_signatures=dependency_signatures,
-            target_info=target_info
-        )
+                error_comment = f"// [ERROR] Test generation failed for methods {group} after {max_retries} attempts. See logs for details."
+                all_test_class_outputs.append(error_comment)
+        # --- Merge all group outputs into one test class ---
+        all_methods = []
+        for code in all_test_class_outputs:
+            all_methods.extend(self.extract_all_test_methods(code))
+        final_test_class_code = self.assemble_test_class(target_package_name, custom_imports, target_class_name, all_methods, class_code)
+        final_test_class_code = final_test_class_code.strip()
+        final_test_class_code = re.sub(r'^```[a-zA-Z]*\n', '', final_test_class_code)
+        final_test_class_code = re.sub(r'^```', '', final_test_class_code)
+        final_test_class_code = re.sub(r'```$', '', final_test_class_code)
+        final_test_class_code = final_test_class_code.strip()
+        try:
+            with open(test_output_file_path, 'w', encoding='utf-8') as f:
+                f.write(final_test_class_code)
+            print(f"[FINAL SUCCESS] Generated test case saved to: '{test_output_file_path}'")
+        except Exception as e:
+            print(f"[FINAL ERROR] Could not save test case to '{test_output_file_path}': {e}")
+        print("\n--- FINAL GENERATED TEST CASE (Printed to Console for review) ---")
+        print(final_test_class_code)
+        print("\n" + "="*80 + "\n")
+        return final_test_class_code
 
     def extract_public_methods(self, class_code: str) -> set:
         """
