@@ -3,6 +3,7 @@ from pathlib import Path
 import os
 import json 
 from typing import List, Dict, Any, Union
+import re
 
 # Assuming the script is located within the project, e.g., 'your_project_root/src/your_module/script.py'
 # TESTGEN_AUTOMATION_ROOT will be 'your_project_root/'
@@ -49,7 +50,7 @@ if not GOOGLE_API_KEY:
     print("Example: export GOOGLE_API_KEY='your_google_api_key_here'")
 
 # LLM model definition - Using Gemini 1.5 Flash for potentially better rate limits and speed
-LLM_MODEL_NAME_GEMINI = "gemini-1.5-flash" 
+LLM_MODEL_NAME_GEMINI = "gemini-2.0-flash" 
 
 EMBEDDING_MODEL_NAME_BGE = "BAAI/bge-small-en-v1.5"
 # Use 'mps' for Apple Silicon (M1/M2/M3 chips) if available, otherwise 'cpu'
@@ -222,19 +223,42 @@ class TestCaseGenerator:
                 target_class_name, target_package_name, custom_imports, additional_query_instructions, dependency_signatures
             )
 
-    def generate_test_plan(self, target_class_name: str, class_code: str) -> List[Dict[str, str]]:
+    def generate_test_plan(self, target_class_name: str, class_code: str, real_methods: list = None) -> List[Dict[str, str]]:
         """
         Step 1: Ask the LLM to generate a test plan (method names + descriptions) for the class.
         Returns a list of dicts: [{"method_name": ..., "description": ...}, ...]
         """
-        plan_prompt = f"""
-You are an expert Java test designer. Given the following class, list all public methods and, for each, describe the test cases you would write. For each test case, provide:
-- The test method name (e.g., shouldReturnXWhenY)
-- A one-sentence description of what it tests (including edge cases, exceptions, etc.)
+        # If real_methods is provided, use it for the prompt (for stricter retries)
+        if real_methods is not None:
+            method_list_str = "\n".join(f'- {m}' for m in real_methods)
+            plan_prompt = f"""
+You are an expert Java test designer. The following class has these public methods:
+{method_list_str}
 
-Do NOT output any code, just a structured test plan in this format:
-Test method: <methodName>
-Description: <description>
+ONLY generate a test plan for these methods, in this exact order, using the exact names. Do NOT invent or omit any methods. If you do, you will be penalized.
+
+Output a JSON array like:
+[
+  {{"method": "setSessionObject", "description": "..."}},
+  {{"method": "updateCacheObj", "description": "..."}},
+  ...
+]
+
+--- BEGIN CLASS UNDER TEST ---
+{class_code}
+--- END CLASS UNDER TEST ---
+"""
+        else:
+            plan_prompt = f"""
+You are an expert Java test designer. Given the following class, list all public methods and, for each, describe the test cases you would write. For each method, provide:
+- The method name (as in the class)
+- A one-sentence description of what you would test for this method (including edge cases, exceptions, etc.)
+
+Do NOT invent or omit any methods. Output a JSON array like:
+[
+  {{"method": "setSessionObject", "description": "..."}},
+  ...
+]
 
 --- BEGIN CLASS UNDER TEST ---
 {class_code}
@@ -246,25 +270,52 @@ Description: <description>
         if hasattr(result, "content"):
             result = result.content
         print("\n--- DEBUG: TEST PLAN OUTPUT ---\n" + result + "\n--- END TEST PLAN OUTPUT ---\n")
-        # Parse the output into a list of test cases
-        test_cases = []
-        for block in result.split("Test method:"):
-            lines = block.strip().splitlines()
-            if not lines or not lines[0].strip():
-                continue
-            method_name = lines[0].strip()
-            description = ""
-            for l in lines[1:]:
-                if l.lower().startswith("description:"):
-                    description = l[len("description:"):].strip()
-            if method_name:
-                test_cases.append({"method_name": method_name, "description": description})
-        return test_cases
+        # Try to parse as JSON
+        try:
+            test_cases = json.loads(result)
+            # Normalize to expected format
+            parsed = []
+            for entry in test_cases:
+                if isinstance(entry, dict) and 'method' in entry:
+                    parsed.append({"method_name": entry['method'], "description": entry.get('description', '')})
+            return parsed
+        except Exception as e:
+            print(f"[WARNING] Could not parse LLM output as JSON: {e}")
+            # Fallback: try to parse as before (legacy)
+            test_cases = []
+            for block in result.split("Method:"):
+                lines = block.strip().splitlines()
+                if not lines or not lines[0].strip():
+                    continue
+                method_name = lines[0].strip()
+                description = ""
+                for l in lines[1:]:
+                    if l.lower().startswith("description:"):
+                        description = l[len("description:"):].strip()
+                if method_name:
+                    test_cases.append({"method_name": method_name, "description": description})
+            return test_cases
 
-    def generate_test_method(self, target_class_name: str, class_code: str, test_case: Dict[str, str], custom_imports: List[str], test_type: str, error_feedback: str = None) -> str:
+    def extract_all_test_methods(self, code: str) -> list:
         """
-        Step 2: For each test case, generate the test method code using a focused prompt.
-        Optionally, provide error feedback for retry/fix attempts.
+        Extract all valid @Test methods from LLM output, even if wrapped in a class or with imports.
+        Returns a list of cleaned method strings.
+        """
+        # Remove code blocks, imports, package, class/interface/enum wrappers
+        code = re.sub(r"```[\s\S]*?```", "", code)
+        code = re.sub(r"^\s*import\s+.*;\s*", "", code, flags=re.MULTILINE)
+        code = re.sub(r"^\s*package\s+.*;\s*", "", code, flags=re.MULTILINE)
+        code = re.sub(r"^\s*(public\s+)?(class|interface|enum)\s+\w+\s*\{", "", code, flags=re.MULTILINE)
+        code = re.sub(r"^\s*}\s*$", "", code, flags=re.MULTILINE)
+        # Find all @Test methods
+        method_pattern = re.compile(r"@Test\s+void\s+\w+\s*\([^)]*\)\s*\{[\s\S]*?\n\}", re.MULTILINE)
+        methods = [m.group(0).strip() for m in method_pattern.finditer(code)]
+        return methods
+
+    def generate_test_method(self, target_class_name: str, class_code: str, test_case: Dict[str, str], custom_imports: List[str], test_type: str, error_feedback: str = None) -> list:
+        """
+        For each test case, generate the test method code using a focused prompt.
+        Returns a list of all valid @Test methods found in the LLM output.
         """
         imports_section = '\n'.join(custom_imports) if custom_imports else ''
         method_prompt = f"""
@@ -277,26 +328,64 @@ Test method name: {test_case['method_name']}
 Description: {test_case['description']}
 
 STRICT REQUIREMENTS:
-- Output ONLY the Java test method code, no explanations or markdown.
+- Output ONLY the Java test method code, no class definition, no imports, no explanations, no markdown.
 - Use Mockito for mocking dependencies.
 - Use JUnit5 assertions.
 - Do NOT repeat the class under test.
-- Use the following imports if needed:
+- Use the following imports if needed (but do NOT output import statements):
 {imports_section}
 """
-        if error_feedback:
-            method_prompt += f"\n--- ERROR FEEDBACK FROM PREVIOUS ATTEMPT ---\n{error_feedback}\n--- END ERROR FEEDBACK ---\n"
-        print(f"\n--- DEBUG: TEST METHOD PROMPT for {test_case['method_name']} ---\n" + method_prompt + "\n--- END TEST METHOD PROMPT ---\n")
-        result = self.llm.invoke(method_prompt)
-        if hasattr(result, "content"):
-            result = result.content
-        print(f"\n--- DEBUG: TEST METHOD OUTPUT for {test_case['method_name']} ---\n" + result + "\n--- END TEST METHOD OUTPUT ---\n")
-        # Extract code block if present
-        code = result.strip()
-        if "```" in code:
-            code = code.split("```", 2)[1]
-            if code.startswith("java"): code = code[len("java"):].strip()
-        return code
+        max_retries = 5
+        for attempt in range(max_retries):
+            prompt = method_prompt
+            if error_feedback and attempt > 0:
+                prompt += f"\n--- ERROR FEEDBACK FROM PREVIOUS ATTEMPT ---\n{error_feedback}\n--- END ERROR FEEDBACK ---\n"
+            result = self.llm.invoke(prompt)
+            if hasattr(result, "content"):
+                result = result.content
+            code = result.strip()
+            print(f"\n--- RAW LLM OUTPUT (Attempt {attempt+1}) ---\n{code}\n--- END RAW LLM OUTPUT ---\n")
+            methods = self.extract_all_test_methods(code)
+            if methods:
+                return methods
+            # Prepare explicit feedback for next retry
+            error_feedback = (
+                "Your previous output was invalid. STRICTLY output ONLY valid Java test method(s) with @Test annotation, "
+                "no import statements, no class/interface/enum/package definitions, no markdown, and no explanations. "
+                "Do NOT output anything except the method(s)."
+            )
+        # If all retries fail, return a comment as a single method
+        return [f"// [ERROR] LLM failed to generate a valid test method for {test_case['method_name']} after {max_retries} attempts."]
+
+    def _clean_and_validate_method_code(self, code: str) -> Union[str, None]:
+        """
+        Clean and validate LLM output for a Java test method. If missing @Test but otherwise valid, add it. Returns cleaned code if valid, else None.
+        """
+        # Remove code blocks (markdown)
+        code = re.sub(r"```[\s\S]*?```", "", code)
+        # Remove import statements
+        code = re.sub(r"^\s*import\s+.*;\s*", "", code, flags=re.MULTILINE)
+        # Remove class/interface/enum definitions
+        code = re.sub(r"^\s*(public\s+)?(class|interface|enum)\s+\w+\s*\{[\s\S]*?\}", "", code, flags=re.MULTILINE)
+        # Remove package statements
+        code = re.sub(r"^\s*package\s+.*;\s*", "", code, flags=re.MULTILINE)
+        # Remove any remaining @ExtendWith or similar annotations outside methods
+        code = re.sub(r"^\s*@\w+\(.*\)\s*", "", code, flags=re.MULTILINE)
+        # Remove stray semicolons at the start of lines
+        code = re.sub(r"^\s*;\s*$", "", code, flags=re.MULTILINE)
+        # Remove empty lines
+        code = "\n".join([line for line in code.splitlines() if line.strip()])
+        # Accept if it contains a method signature (void ...) and no import/class/interface/enum/package
+        if re.search(r"void\s+\w+\s*\(", code):
+            # If missing @Test, add it at the top
+            if not re.search(r"@Test", code):
+                code = "@Test\n" + code
+            # Should not contain any import/class/interface/enum/package after cleaning
+            if re.search(r"import\s|class\s|interface\s|enum\s|package\s", code):
+                return None
+            return code.strip()
+        # Otherwise, reject
+        return None
 
     def generate_test_case(self, 
                            target_class_name: str, 
@@ -310,23 +399,80 @@ STRICT REQUIREMENTS:
                            target_info: Dict[str, Any] = None) -> str:
         # --- Two-step approach for service/controller/repository ---
         test_type = self._detect_test_type(target_info or {})
+        # --- NEW: Union dependency-based and import-based retrieval ---
+        all_imports = target_info.get('all_imports', []) if target_info else []
+        project_base_package = "com.iemr"  # Change if your base package is different
+        imported_project_files = []
+        import_re = re.compile(r'import\s+(' + re.escape(project_base_package) + r'\.[\w\.]+)\.(\w+);')
+        for imp in all_imports:
+            m = import_re.match(imp)
+            if m:
+                class_name = m.group(2)
+                imported_project_files.append(f"{class_name}.java")
+        # Union with dependency-based retrieval
+        relevant_java_files_for_context = list(set(relevant_java_files_for_context) | set(imported_project_files))
         if test_type in ("service", "controller", "repository"):
             self._update_retriever_filter(relevant_java_files_for_context, k_override=10)
             retrieved_docs = self.retriever.get_relevant_documents(f"Full code for {target_class_name}")
             class_code = "\n\n".join([doc.page_content for doc in retrieved_docs if target_class_name in doc.page_content])
             if not class_code:
                 class_code = "\n\n".join([doc.page_content for doc in retrieved_docs])
-            test_plan = self.generate_test_plan(target_class_name, class_code)
-            if not test_plan:
-                print("[ERROR] LLM did not return a valid test plan. Aborting test generation.")
-                return ""
+
+            # --- Test Plan Generation with Validation, Retry, and Auto-correction ---
+            max_test_plan_retries = 3
+            real_methods = sorted(self.extract_public_methods(class_code))
+            test_plan = []
+            for plan_attempt in range(max_test_plan_retries):
+                test_plan = self.generate_test_plan(target_class_name, class_code, real_methods=real_methods)
+                if not test_plan:
+                    print("[ERROR] LLM did not return a valid test plan. Aborting test generation.")
+                    return ""
+                plan_methods = self.extract_test_plan_methods(test_plan)
+                missing_methods = set(real_methods) - plan_methods
+                hallucinated_methods = plan_methods - set(real_methods)
+                # Auto-correct: add missing, remove hallucinated
+                if missing_methods or hallucinated_methods:
+                    print(f"[VALIDATION] Test plan mismatch. Missing methods: {missing_methods}, Hallucinated methods: {hallucinated_methods}")
+                    # Remove hallucinated
+                    test_plan = [tc for tc in test_plan if tc['method_name'] in real_methods]
+                    # Add missing with placeholder
+                    for m in missing_methods:
+                        test_plan.append({"method_name": m, "description": "No description provided (auto-added)."})
+                    # Sort to match real_methods order
+                    test_plan = sorted(test_plan, key=lambda x: real_methods.index(x['method_name']))
+                if not missing_methods and not hallucinated_methods:
+                    break  # Test plan is valid
+                print("[VALIDATION] Auto-corrected test plan. Retrying if needed...")
+                # If last retry, just use the auto-corrected plan
+                if plan_attempt == max_test_plan_retries - 1:
+                    print("[VALIDATION] Using auto-corrected test plan after retries.")
+            # --- If LLM still fails, fallback to per-method prompting ---
+            if not test_plan or len(test_plan) != len(real_methods):
+                print("[FALLBACK] LLM failed to generate a valid test plan. Using per-method prompting.")
+                test_plan = []
+                for m in real_methods:
+                    per_method_prompt = f"""
+You are an expert Java test designer. For the method '{m}' in the following class, provide a one-sentence description of what you would test (including edge cases, exceptions, etc.).
+
+--- BEGIN CLASS UNDER TEST ---
+{class_code}
+--- END CLASS UNDER TEST ---
+Output only the description, no code or method name.
+"""
+                    result = self.llm.invoke(per_method_prompt)
+                    if hasattr(result, "content"):
+                        result = result.content
+                    description = result.strip().splitlines()[0] if result.strip() else "No description provided."
+                    test_plan.append({"method_name": m, "description": description})
+            # --- Continue as before with validated test_plan ---
             test_methods = []
             method_errors = {}
             for test_case in test_plan:
                 error_feedback = None
                 for attempt in range(MAX_TEST_GENERATION_RETRIES):
-                    method_code = self.generate_test_method(target_class_name, class_code, test_case, custom_imports, test_type, error_feedback=error_feedback)
-                    # Assemble a temporary test class with all previous methods + this one
+                    method_codes = self.generate_test_method(target_class_name, class_code, test_case, custom_imports, test_type, error_feedback=error_feedback)
+                    # method_codes is now a list of methods
+                    # Assemble a temporary test class with all previous methods + these
                     imports_section = '\n'.join(custom_imports) if custom_imports else ''
                     temp_test_class_code = f"""
 package {target_package_name};
@@ -342,7 +488,7 @@ import static org.junit.jupiter.api.Assertions.*;
 
 @ExtendWith(MockitoExtension.class)
 class {target_class_name}Test {{
-{chr(10).join(test_methods + [method_code])}
+{chr(10).join(test_methods + method_codes)}
 }}
 """
                     # Write to file and try to compile/run
@@ -351,7 +497,7 @@ class {target_class_name}Test {{
                         f.write(temp_test_class_code)
                     test_run_results = self.java_test_runner.run_test(test_output_file_path)
                     if test_run_results["status"] == "SUCCESS":
-                        test_methods.append(method_code)
+                        test_methods.extend(method_codes)
                         break
                     else:
                         # Prepare error feedback for next attempt
@@ -387,26 +533,9 @@ class {target_class_name}Test {{
                         print(f"\n--- DEBUG: ERROR FEEDBACK FOR {test_case['method_name']} (Attempt {attempt+1}) ---\n{error_feedback}\n--- END ERROR FEEDBACK ---\n")
                         if attempt == MAX_TEST_GENERATION_RETRIES - 1:
                             print(f"[ERROR] Failed to generate a passing test method for {test_case['method_name']} after {MAX_TEST_GENERATION_RETRIES} attempts.")
-                            test_methods.append(method_code)  # Save the last attempt anyway
+                            test_methods.extend(method_codes)  # Save the last attempt anyway
             # Step 3: Assemble the final test class
-            imports_section = '\n'.join(custom_imports) if custom_imports else ''
-            test_class_code = f"""
-package {target_package_name};
-
-{imports_section}
-import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.extension.ExtendWith;
-import org.mockito.InjectMocks;
-import org.mockito.Mock;
-import org.mockito.junit.jupiter.MockitoExtension;
-import static org.mockito.Mockito.*;
-import static org.junit.jupiter.api.Assertions.*;
-
-@ExtendWith(MockitoExtension.class)
-class {target_class_name}Test {{
-{chr(10).join(test_methods)}
-}}
-"""
+            test_class_code = self.assemble_test_class(target_package_name, custom_imports, target_class_name, test_methods, class_code)
             # Write the generated test class to file (overwrite, not append)
             with open(test_output_file_path, 'w', encoding='utf-8') as f:
                 f.write(test_class_code)
@@ -438,6 +567,123 @@ class {target_class_name}Test {{
             dependency_signatures=dependency_signatures,
             target_info=target_info
         )
+
+    def extract_public_methods(self, class_code: str) -> set:
+        """
+        Extracts all public method names from the given Java class code using regex.
+        """
+        # This regex matches public methods (not constructors, not static blocks)
+        method_pattern = re.compile(r'public\s+[\w<>\[\]]+\s+(\w+)\s*\(')
+        return set(method_pattern.findall(class_code))
+
+    def extract_test_plan_methods(self, test_plan: list) -> set:
+        """
+        Extracts method names from the LLM-generated test plan.
+        """
+        return set(tc['method_name'] for tc in test_plan if 'method_name' in tc)
+
+    def assemble_test_class(self, package_name: str, imports: List[str], class_name: str, test_methods: List[str], class_code: str = "") -> str:
+        """
+        Assemble the final test class file with package, imports, annotations, class definition, and all test methods.
+        Auto-detects and adds missing imports for all classes used in the test methods.
+        """
+        # Auto-detect used class names and add missing imports
+        used_class_names = self._extract_used_class_names(test_methods)
+        auto_imports = self._map_class_names_to_imports(used_class_names, class_code, extra_known_imports=imports)
+        # Compose package statement
+        package_stmt = f"package {package_name};\n" if package_name else ""
+        # Compose imports (unique, sorted)
+        import_lines = sorted(set(imports + auto_imports + [
+            "org.junit.jupiter.api.Test",
+            "org.junit.jupiter.api.extension.ExtendWith",
+            "org.mockito.InjectMocks",
+            "org.mockito.Mock",
+            "org.mockito.junit.jupiter.MockitoExtension",
+            "static org.mockito.Mockito.*",
+            "static org.junit.jupiter.api.Assertions.*"
+        ]))
+        import_section = "\n".join(f"import {imp};" for imp in import_lines if not imp.startswith("static "))
+        static_import_section = "\n".join(f"import {imp};" for imp in import_lines if imp.startswith("static "))
+        # Compose class annotation and definition
+        class_anno = "@ExtendWith(MockitoExtension.class)"
+        class_def = f"class {class_name}Test {{"
+        # Join all test methods
+        methods_section = "\n\n".join(m for m in test_methods if m.strip())
+        # Final assembly
+        return f"{package_stmt}\n{import_section}\n{static_import_section}\n\n{class_anno}\n{class_def}\n\n{methods_section}\n\n}}"
+
+    def _extract_used_class_names(self, test_methods: List[str]) -> set:
+        """
+        Extracts all class names used in the test methods (simple heuristic: capitalized words, not primitives).
+        """
+        java_keywords = {"int", "long", "float", "double", "boolean", "char", "byte", "short", "void", "String", "assert", "return", "if", "else", "for", "while", "switch", "case", "break", "continue", "new", "public", "private", "protected", "static", "final", "class", "interface", "enum", "try", "catch", "finally", "throw", "throws", "extends", "implements", "import", "package", "this", "super", "synchronized", "volatile", "transient", "abstract", "native", "strictfp", "default", "instanceof", "true", "false", "null"}
+        class_names = set()
+        for method in test_methods:
+            # Find all capitalized words (potential class names)
+            for match in re.findall(r'\b([A-Z][A-Za-z0-9_]*)\b', method):
+                if match not in java_keywords:
+                    class_names.add(match)
+        return class_names
+
+    def _map_class_names_to_imports(self, class_names: set, class_code: str, extra_known_imports: List[str] = None) -> List[str]:
+        """
+        Map class names to import statements using a known mapping, the class under test's imports, and any extra known imports.
+        """
+        # Known mapping for common Java/Mockito/JUnit/Servlet classes
+        known_imports = {
+            "Optional": "java.util.Optional",
+            "List": "java.util.List",
+            "ArrayList": "java.util.ArrayList",
+            "Map": "java.util.Map",
+            "HashMap": "java.util.HashMap",
+            "Set": "java.util.Set",
+            "HashSet": "java.util.HashSet",
+            "Cookie": "jakarta.servlet.http.Cookie",
+            "HttpServletRequest": "jakarta.servlet.http.HttpServletRequest",
+            "HttpServletResponse": "jakarta.servlet.http.HttpServletResponse",
+            "MockedStatic": "org.mockito.MockedStatic",
+            "ArgumentCaptor": "org.mockito.ArgumentCaptor",
+            "InjectMocks": "org.mockito.InjectMocks",
+            "Mock": "org.mockito.Mock",
+            "ExtendWith": "org.junit.jupiter.api.extension.ExtendWith",
+            "Test": "org.junit.jupiter.api.Test",
+            "BeforeEach": "org.junit.jupiter.api.BeforeEach",
+            "AfterEach": "org.junit.jupiter.api.AfterEach",
+            "DisplayName": "org.junit.jupiter.api.DisplayName",
+            "Assertions": "org.junit.jupiter.api.Assertions",
+            "Mockito": "org.mockito.Mockito",
+            "Service": "org.springframework.stereotype.Service",
+            "Autowired": "org.springframework.beans.factory.annotation.Autowired",
+            "Captor": "org.mockito.Captor",
+            "Disabled": "org.junit.jupiter.api.Disabled",
+            "ParameterizedTest": "org.junit.jupiter.params.ParameterizedTest",
+            "ValueSource": "org.junit.jupiter.params.provider.ValueSource",
+            "CsvSource": "org.junit.jupiter.params.provider.CsvSource",
+            "SpringBootTest": "org.springframework.boot.test.context.SpringBootTest",
+            "Transactional": "org.springframework.transaction.annotation.Transactional",
+            "EntityManager": "jakarta.persistence.EntityManager",
+            "Base64": "java.util.Base64",
+            "UUID": "java.util.UUID",
+            "Stream": "java.util.stream.Stream",
+            "Collectors": "java.util.stream.Collectors",
+        }
+        # Add extra known imports if provided
+        if extra_known_imports:
+            for imp in extra_known_imports:
+                # Try to extract class name from import
+                m = re.match(r'(?:static\s+)?([\w\.]+)\.([A-Z][A-Za-z0-9_]*)', imp)
+                if m:
+                    known_imports[m.group(2)] = m.group(1) + '.' + m.group(2)
+        # Extract imports from class_code
+        for imp in re.findall(r'import\s+([\w\.]+);', class_code):
+            class_name = imp.split('.')[-1]
+            known_imports[class_name] = imp
+        # Map class names to imports
+        imports = []
+        for name in class_names:
+            if name in known_imports:
+                imports.append(known_imports[name])
+        return imports
 
 if __name__ == "__main__":
     try:
