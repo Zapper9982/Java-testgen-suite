@@ -407,8 +407,7 @@ class {target_class_name}Test {{
 {chr(10).join(test_methods)}
 }}
 """
-            # Write the generated test class to file
-            os.makedirs(test_output_file_path.parent, exist_ok=True)
+            # Write the generated test class to file (overwrite, not append)
             with open(test_output_file_path, 'w', encoding='utf-8') as f:
                 f.write(test_class_code)
             print(f"[TWO-STEP] Generated test class saved to: '{test_output_file_path}'")
