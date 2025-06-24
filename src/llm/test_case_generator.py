@@ -65,7 +65,17 @@ ANALYSIS_RESULTS_DIR = TESTGEN_AUTOMATION_ROOT / "analysis_results"
 ANALYSIS_RESULTS_FILE = ANALYSIS_RESULTS_DIR / "spring_boot_targets.json"
 
 # Max retries for test generation + fixing
-MAX_TEST_GENERATION_RETRIES = 3 
+MAX_TEST_GENERATION_RETRIES = 15
+
+# --- Token Estimation Utility ---
+def estimate_token_count(text: str) -> int:
+    """
+    Roughly estimate the number of tokens for Gemini (1 token ≈ 4 characters).
+    """
+    return len(text) // 4
+
+MAX_TOTAL_TOKENS = 45000  # Stay below 50K for safety
+MIN_K = 3  # Minimum number of context chunks
 
 def get_test_paths(relative_filepath_from_processed_output: str, project_root: Path):
     """
@@ -152,10 +162,11 @@ class TestCaseGenerator:
         print(f"Using Google Gemini LLM: {LLM_MODEL_NAME_GEMINI}...")
         return ChatGoogleGenerativeAI(model=LLM_MODEL_NAME_GEMINI, temperature=0.7)
 
-    def _update_retriever_filter(self, filenames: Union[str, List[str]]):
+    def _update_retriever_filter(self, filenames: Union[str, List[str]], k_override: int = None):
         """
         Updates the retriever's filter to target a specific filename or a list of filenames.
         This allows the retriever to fetch chunks from the target file and its dependencies.
+        Optionally, k_override can be used to force a lower k if token budget is exceeded.
         """
         if isinstance(filenames, str):
             filter_filenames = [filenames]
@@ -170,8 +181,10 @@ class TestCaseGenerator:
             if util_file not in filter_filenames:
                 filter_filenames.append(util_file)
 
-        # Dynamically set k based on number of files
+        # Dynamically set k based on number of files, but allow override
         k = min(30, 5 + 2 * len(filter_filenames))
+        if k_override is not None:
+            k = max(MIN_K, k_override)
 
         self.retriever = self.vectorstore.as_retriever(
             search_type="mmr",
@@ -219,13 +232,38 @@ class TestCaseGenerator:
                            requires_db_test: bool,
                            dependency_signatures: Dict[str, str] = None,
                            target_info: Dict[str, Any] = None) -> str:
-        self._update_retriever_filter(relevant_java_files_for_context)
-        test_type = self._detect_test_type(target_info or {})
-        print(f"Generating {test_type.upper()} test for {target_class_name}...")
-        base_template = self._get_prompt_template(
-            test_type, target_class_name, target_package_name, custom_imports,
-            additional_query_instructions, dependency_signatures
-        )
+        # --- Context Chunk Trimming Logic ---
+        k = min(30, 5 + 2 * len(relevant_java_files_for_context))
+        context_trimmed = False
+        while True:
+            self._update_retriever_filter(relevant_java_files_for_context, k_override=k)
+            test_type = self._detect_test_type(target_info or {})
+            print(f"Generating {test_type.upper()} test for {target_class_name}...")
+            base_template = self._get_prompt_template(
+                test_type, target_class_name, target_package_name, custom_imports,
+                additional_query_instructions, dependency_signatures
+            )
+
+            # Estimate token count for prompt template and user query (before context)
+            static_prompt_tokens = estimate_token_count(base_template + f"Generate tests for {target_class_name}.")
+            print(f"[Token Estimation] Static prompt (template + query): ~{static_prompt_tokens} tokens")
+
+            # Retrieve context chunks (simulate by fetching from retriever)
+            # We'll get the actual context when calling the QA chain, but we can estimate here
+            # For now, just estimate based on k and average chunk size (assume 1000 chars per chunk)
+            avg_chunk_chars = 1000
+            context_tokens = (k * avg_chunk_chars) // 4
+            total_estimated_tokens = static_prompt_tokens + context_tokens
+            print(f"[Token Estimation] With k={k}, estimated total tokens: ~{total_estimated_tokens}")
+
+            if total_estimated_tokens > MAX_TOTAL_TOKENS and k > MIN_K:
+                print(f"[Token Estimation] Exceeds {MAX_TOTAL_TOKENS} tokens. Reducing k and retrying...")
+                k = max(MIN_K, k - 2)
+                context_trimmed = True
+                continue
+            break
+        if context_trimmed:
+            print(f"[Token Estimation] Final k after trimming: {k}")
 
         generated_code = ""
         for retry_attempt in range(MAX_TEST_GENERATION_RETRIES):
@@ -233,77 +271,80 @@ class TestCaseGenerator:
             
             # Construct the prompt for the current attempt
             current_prompt_query = f"Generate tests for {target_class_name}."
+            # Retrieve relevant code chunks for context
+            retrieved_docs = self.retriever.get_relevant_documents(current_prompt_query)
+            retrieved_code = "\n\n".join([doc.page_content for doc in retrieved_docs])
+            # --- Unified context construction ---
+            context_parts = [base_template, retrieved_code]
             if retry_attempt > 0 and self.last_test_run_results:
-                # Safely get stdout/stderr and escape any curly braces
-                # Fix: Escape curly braces in stdout/stderr to prevent f-string formatting errors
-                stdout_content = self.last_test_run_results.get('stdout', '').replace('{', '{{').replace('}', '}}')
-                stderr_content = self.last_test_run_results.get('stderr', '').replace('{', '{{').replace('}', '}}')
-
-                # Prepare detailed error feedback
+                def escape_curly_braces(s):
+                    return s.replace('{', '{{').replace('}', '}}') if s else s
+                stdout_content = escape_curly_braces(self.last_test_run_results.get('stdout', ''))
+                stderr_content = escape_curly_braces(self.last_test_run_results.get('stderr', ''))
                 detailed_feedback = ""
                 if self.last_test_run_results.get('detailed_errors'):
                     comp_errors = self.last_test_run_results['detailed_errors'].get('compilation_errors', [])
                     test_failures = self.last_test_run_results['detailed_errors'].get('test_failures', [])
                     general_msgs = self.last_test_run_results['detailed_errors'].get('general_messages', [])
-
                     if comp_errors:
                         detailed_feedback += "\n--- COMPILATION ERRORS ---\n"
                         for err in comp_errors:
-                            detailed_feedback += f"File: {err.get('file', 'N/A')}, Line: {err.get('line', 'N/A')}, Col: {err.get('column', 'N/A')}, Message: {err.get('message', 'N/A')}\n"
+                            detailed_feedback += f"File: {escape_curly_braces(str(err.get('file', 'N/A')))}, Line: {escape_curly_braces(str(err.get('line', 'N/A')))}, Col: {escape_curly_braces(str(err.get('column', 'N/A')))}, Message: {escape_curly_braces(str(err.get('message', 'N/A')))}\n"
                     if test_failures:
                         detailed_feedback += "\n--- TEST FAILURES ---\n"
                         for failure in test_failures:
-                            detailed_feedback += f"Summary: {failure.get('summary', 'N/A')}\n"
+                            detailed_feedback += f"Summary: {escape_curly_braces(str(failure.get('summary', 'N/A')))}\n"
                             for detail in failure.get('details', []):
-                                detailed_feedback += f"  - {detail}\n"
+                                detailed_feedback += f"  - {escape_curly_braces(str(detail))}\n"
                     if general_msgs:
                         detailed_feedback += "\n--- GENERAL BUILD MESSAGES ---\n"
                         for msg in general_msgs:
-                            detailed_feedback += f"  - {msg}\n"
-                
-                # --- NEW DEBUGGING PRINTS ---
-                print("\n--- DETAILED ERROR FEEDBACK SENT TO LLM (for debugging) ---")
-                print(detailed_feedback)
-                print("\n--- COMPLETE ERROR FEEDBACK MESSAGE SENT TO LLM (for debugging) ---")
-                # Also print the full message for complete context
+                            detailed_feedback += f"  - {escape_curly_braces(str(msg))}\n"
                 error_feedback_message = (
                     "\n\n--- PREVIOUS ATTEMPT FEEDBACK ---\n"
                     f"The previously generated test for `{target_class_name}` encountered the following issue:\n"
-                    f"Status: {self.last_test_run_results.get('status', 'N/A')}\n"
-                    f"Message: {self.last_test_run_results.get('message', 'N/A')}\n"
-                    f"{detailed_feedback}" # Insert detailed feedback here
-                    f"Full STDOUT (truncated):\n{stdout_content[:2000]}...\n" # Truncate for prompt length
-                    f"Full STDERR (truncated):\n{stderr_content[:2000]}...\n" # Truncate for prompt length
+                    f"Status: {escape_curly_braces(self.last_test_run_results.get('status', 'N/A'))}\n"
+                    f"Message: {escape_curly_braces(self.last_test_run_results.get('message', 'N/A'))}\n"
+                    f"{detailed_feedback}"
+                    f"Full STDOUT (truncated):\n{stdout_content[:2000]}...\n"
+                    f"Full STDERR (truncated):\n{stderr_content[:2000]}...\n"
                     f"Please analyze the errors/failures and revise the test code to fix them."
                     f"Ensure you still adhere to all original instructions (Mockito usage, coverage, imports, etc.)."
                     f"\n--- END PREVIOUS ATTEMPT FEEDBACK ---\n"
                 )
-                print(error_feedback_message)
-                print("\n--------------------------------------------------------------")
-                # --- END NEW DEBUGGING PRINTS ---
-
-                # Modify the template to include feedback
-                template_with_feedback = base_template + error_feedback_message 
-                QA_CHAIN_PROMPT = PromptTemplate.from_template(template_with_feedback)
-            else:
-                QA_CHAIN_PROMPT = PromptTemplate.from_template(base_template)
-
-            # Initialize or update the QA chain with the dynamic prompt
-            # This handles cases where QA_CHAIN_PROMPT might be re-assigned in the loop
-            if self.qa_chain: # Update existing chain if it exists
+                # DEBUG: Print the error feedback context being sent
+                print("\n--- DEBUG: ERROR FEEDBACK CONTEXT SENT TO LLM ---")
+                print(error_feedback_message[:3000])  # Print up to 3000 chars for readability
+                print("--- END ERROR FEEDBACK CONTEXT DEBUG ---\n")
+                context_parts.append(error_feedback_message)
+            # Join all context parts
+            full_context = '\n'.join(context_parts)
+            # DEBUG: Print the actual context/code being sent to the LLM
+            print("\n--- DEBUG: CONTEXT SENT TO LLM FOR TEST GENERATION ---")
+            print(full_context[:5000])  # Print up to 5000 chars for readability
+            print("--- END CONTEXT DEBUG ---\n")
+            # Use a safe PromptTemplate with only {context}
+            QA_CHAIN_PROMPT = PromptTemplate(
+                input_variables=["context"],
+                template="""
+<context>
+{context}
+</context>
+"""
+            )
+            # Initialize or update the QA chain with the safe prompt
+            if self.qa_chain:
                 self.qa_chain.combine_documents_chain.llm_chain.prompt = QA_CHAIN_PROMPT
-            else: # Initialize new chain if it doesn't exist
+            else:
                 self.qa_chain = RetrievalQA.from_chain_type(
                     llm=self.llm,
                     chain_type="stuff",
                     retriever=self.retriever,
-                    return_source_documents=True, 
+                    return_source_documents=True,
                     chain_type_kwargs={"prompt": QA_CHAIN_PROMPT}
                 )
-
-
             try:
-                result = self.qa_chain({"query": current_prompt_query})
+                result = self.qa_chain({"query": full_context})
                 response_text = result["result"]
 
                 # Extract code block

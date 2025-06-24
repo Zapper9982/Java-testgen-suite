@@ -15,24 +15,24 @@ import static org.mockito.Mockito.*;
 import static org.junit.jupiter.api.Assertions.*;
 
 @ExtendWith(MockitoExtension.class)
-class UserServiceTest {{
-    @Mock UserRepository userRepository;
+class UserServiceTest {
+    @Mock UserRepository ;
     @InjectMocks UserService userService;
 
     @Test
-    void shouldReturnUser_whenUserExists() {{
+    void shouldReturnUser_whenUserExists() {
         User user = new User("alice");
-        when(userRepository.findByName("alice")).thenReturn(user);
+        when(userRepository.findByName("alice")userRepository).thenReturn(user);
         User result = userService.findByName("alice");
         assertEquals("alice", result.getName());
-    }}
-}}
+    }
+}
 '''
 
 NEGATIVE_EXAMPLE = '''
 // BAD EXAMPLE (never do this):
 // import com.fake.NonExistent;
-// @Test void testFake() {{ fail(); }}
+// @Test void testFake() { fail(); }
 // This test will not compile. Never invent imports or methods.
 '''
 
@@ -41,153 +41,70 @@ Output ONLY a single compilable Java code block. If you cannot generate a test f
 """
 
 def get_service_test_prompt_template(target_class_name, target_package_name, custom_imports, additional_query_instructions, dependency_signatures=None):
-    formatted_custom_imports = "\n".join(custom_imports)
-    dependency_context = ""
-    if dependency_signatures:
-        dependency_context += "<dependency_method_signatures>\n"
-        for class_name, signatures in dependency_signatures.items():
-            dependency_context += f"// Methods for dependency: {class_name}\n{signatures}\n\n"
-        dependency_context += "</dependency_method_signatures>\n\n"
     return f"""
-<persona>
-You are an expert Senior Java Developer specializing in writing clean, maintainable, and robust unit tests for Spring Boot services using JUnit 5 and Mockito. Your code must be production-quality and must compile without errors.
-</persona>
-<task>
-Generate a comprehensive JUnit 5 unit test class for the '{target_class_name}' class in the '{target_package_name}' package.
-</task>
-<examples>
-{POSITIVE_EXAMPLE}
-{NEGATIVE_EXAMPLE}
-</examples>
-<rules>
-<rule number="1" importance="critical">Output ONLY compilable Java code. Do NOT output explanations, comments, or text outside the code block.</rule>
-<rule number="2" importance="critical">Use only methods, fields, and dependencies that exist in the provided context. Never hallucinate methods, fields, or imports.</rule>
-<rule number="3" importance="critical">Use `@ExtendWith(MockitoExtension.class)` for JUnit 5.</rule>
-<rule number="4" importance="critical">Declare dependencies to be mocked with `@Mock`.</rule>
-<rule number="5" importance="critical">Declare the class under test with `@InjectMocks`.</rule>
-<rule number="6" importance="high">If '{target_class_name}' calls its own public methods that need stubbing, annotate `@InjectMocks` with `@Spy`.</rule>
-<rule number="7" importance="critical">When stubbing a `@Spy` object, ALWAYS use `doReturn(value).when(spyObject).method()` syntax. NEVER use `when(spyObject.method()).thenReturn(value)` for spies.</rule>
-<rule number="8" importance="critical">Never use undefined variables, ambiguous types, or TODOs. Never use methods or fields not present in the context.</rule>
-<rule number="9" importance="critical">Include all necessary imports. The target class is `import {target_package_name}.{target_class_name};`.</rule>
-<rule number="10" importance="critical">Use `org.junit.jupiter.api.Assertions` for assertions.</rule>
-<rule number="11" importance="high">Create a separate test method for each public method in the class under test. Test edge cases, null inputs, and exception paths.</rule>
-<rule number="12" importance="high">Use meaningful test method names like `testMethod_WhenCondition_ShouldBehavior()`.</rule>
-<rule number="13" importance="critical">Always use the correct constructor and dependency injection style as in the source.</rule>
-<rule number="14" importance="critical">Never use ambiguous or generic types. Always use the exact types from the context.</rule>
-</rules>
-<context>
-<custom_imports_from_source>
-{formatted_custom_imports}
-</custom_imports_from_source>
-{dependency_context}
-<retrieved_source_code>
-{{context}}
-</retrieved_source_code>
-</context>
-<instructions>
-{additional_query_instructions}
-{STRICT_OUTPUT_INSTRUCTIONS}
-Provide ONLY the complete Java code block for the test class, enclosed in ```java ... ```.
-Do not include any explanations or conversational text.
-</instructions>
+You are an expert Java Spring Boot test generator. Your task is to generate a JUnit 5 test class for the service `{target_class_name}` in the package `{target_package_name}`.
+
+STRICT REQUIREMENTS:
+- Output ONLY compilable Java code, no explanations or markdown.
+- Use JUnit 5 (`org.junit.jupiter.api.*`) and Mockito (`org.mockito.*`).
+- Import all required classes, including Spring annotations and Mockito utilities.
+- Use `@ExtendWith(MockitoExtension.class)` for Mockito support.
+- Mock all dependencies using `@Mock` and inject them using `@InjectMocks`.
+- For each public method in the service, generate at least one test method that:
+    - Mocks dependencies as needed for the method under test.
+    - Asserts the return value and side effects using JUnit assertions (e.g., `assertEquals`, `assertThrows`).
+    - Covers both typical and edge cases if possible.
+- Use descriptive test method names (e.g., `shouldReturnXWhenY`).
+- Include all necessary setup (e.g., `@BeforeEach` if needed).
+- Do NOT hallucinate methods or imports—use only what is present in the provided context and imports.
+- Always include `{custom_imports}` in the import section.
+- {additional_query_instructions}
+- If any dependencies or utility classes are required, use only those present in the context.
+- The output must be a single, compilable Java test class.
 """
 
 def get_controller_test_prompt_template(target_class_name, target_package_name, custom_imports, additional_query_instructions, dependency_signatures=None):
-    formatted_custom_imports = "\n".join(custom_imports)
-    dependency_context = ""
-    if dependency_signatures:
-        dependency_context += "<dependency_method_signatures>\n"
-        for class_name, signatures in dependency_signatures.items():
-            dependency_context += f"// Methods for dependency: {class_name}\n{signatures}\n\n"
-        dependency_context += "</dependency_method_signatures>\n\n"
     return f"""
-<persona>
-You are an expert Senior Java Developer specializing in writing robust, isolated unit tests for Spring Boot REST controllers using JUnit 5, Mockito, and MockMvc. Your code must be production-quality and must compile without errors.
-</persona>
-<task>
-Generate a comprehensive JUnit 5 test class for the '{target_class_name}' controller in the '{target_package_name}' package. Use `@WebMvcTest({target_class_name}.class)` and `MockMvc` for endpoint testing.
-</task>
-<examples>
-{POSITIVE_EXAMPLE}
-{NEGATIVE_EXAMPLE}
-</examples>
-<rules>
-<rule number="1" importance="critical">Output ONLY compilable Java code. Do NOT output explanations, comments, or text outside the code block.</rule>
-<rule number="2" importance="critical">Use only methods, fields, and dependencies that exist in the provided context. Never hallucinate methods, fields, or imports.</rule>
-<rule number="3" importance="critical">Use `@WebMvcTest({target_class_name}.class)` for the test class. Do not use `@SpringBootTest`.</rule>
-<rule number="4" importance="critical">Inject `MockMvc` using `@Autowired`.</rule>
-<rule number="5" importance="critical">Mock all dependencies of the controller using `@MockBean`.</rule>
-<rule number="6" importance="high">Write a separate test method for each endpoint (e.g., for each `@GetMapping`, `@PostMapping`, etc.).</rule>
-<rule number="7" importance="critical">Use `mockMvc.perform(...)` to simulate HTTP requests and assert responses.</rule>
-<rule number="8" importance="high">Test edge cases, invalid input, and error responses.</rule>
-<rule number="9" importance="critical">Include all necessary imports. The target class is `import {target_package_name}.{target_class_name};`.</rule>
-<rule number="10" importance="critical">Use `org.springframework.test.web.servlet.result.MockMvcResultMatchers` for assertions.</rule>
-<rule number="11" importance="critical">Never use undefined variables, ambiguous types, or TODOs. Never use methods or fields not present in the context.</rule>
-<rule number="12" importance="critical">Always use the correct constructor and dependency injection style as in the source.</rule>
-<rule number="13" importance="critical">Never use ambiguous or generic types. Always use the exact types from the context.</rule>
-</rules>
-<context>
-<custom_imports_from_source>
-{formatted_custom_imports}
-</custom_imports_from_source>
-{dependency_context}
-<retrieved_source_code>
-{{context}}
-</retrieved_source_code>
-</context>
-<instructions>
-{additional_query_instructions}
-{STRICT_OUTPUT_INSTRUCTIONS}
-Provide ONLY the complete Java code block for the test class, enclosed in ```java ... ```.
-Do not include any explanations or conversational text.
-</instructions>
+You are an expert Java Spring Boot test generator. Your task is to generate a JUnit 5 test class for the controller `{target_class_name}` in the package `{target_package_name}`.
+
+STRICT REQUIREMENTS:
+- Output ONLY compilable Java code, no explanations or markdown.
+- Use JUnit 5 (`org.junit.jupiter.api.*`), Mockito (`org.mockito.*`), and MockMvc (`org.springframework.test.web.servlet.*`).
+- Import all required classes, including Spring annotations, MockMvc, and Mockito utilities.
+- Use `@WebMvcTest({target_class_name}.class)` and proper Spring test configuration.
+- Mock all dependencies using `@MockBean` or `@Mock` as appropriate.
+- Use `@Autowired` for MockMvc and the controller under test.
+- For each public endpoint/method in the controller, generate at least one test method that:
+    - Uses MockMvc to perform the request (e.g., `.perform(get(...))`)
+    - Asserts the response status, content, and any relevant side effects using `andExpect` and JUnit assertions.
+    - Mocks dependencies as needed for each test.
+- Use descriptive test method names (e.g., `shouldReturnXWhenY`).
+- Include all necessary setup (e.g., `@BeforeEach` for MockMvc setup if needed).
+- Do NOT hallucinate methods, endpoints, or imports—use only what is present in the provided context and imports.
+- Always include `{custom_imports}` in the import section.
+- {additional_query_instructions}
+- If any dependencies or utility classes are required, use only those present in the context.
+- The output must be a single, compilable Java test class.
 """
 
 def get_repository_test_prompt_template(target_class_name, target_package_name, custom_imports, additional_query_instructions, dependency_signatures=None):
-    formatted_custom_imports = "\n".join(custom_imports)
-    dependency_context = ""
-    if dependency_signatures:
-        dependency_context += "<dependency_method_signatures>\n"
-        for class_name, signatures in dependency_signatures.items():
-            dependency_context += f"// Methods for dependency: {class_name}\n{signatures}\n\n"
-        dependency_context += "</dependency_method_signatures>\n\n"
     return f"""
-<persona>
-You are an expert Senior Java Developer specializing in writing clean, maintainable, and robust unit tests for Spring Boot repositories using JUnit 5 and Mockito. Your code must be production-quality and must compile without errors.
-</persona>
-<task>
-Generate a comprehensive JUnit 5 unit test class for the '{target_class_name}' repository in the '{target_package_name}' package.
-</task>
-<examples>
-{POSITIVE_EXAMPLE}
-{NEGATIVE_EXAMPLE}
-</examples>
-<rules>
-<rule number="1" importance="critical">Output ONLY compilable Java code. Do NOT output explanations, comments, or text outside the code block.</rule>
-<rule number="2" importance="critical">Use only methods, fields, and dependencies that exist in the provided context. Never hallucinate methods, fields, or imports.</rule>
-<rule number="3" importance="critical">Use `@ExtendWith(MockitoExtension.class)` for the test class.</rule>
-<rule number="4" importance="critical">Mock all dependencies using `@Mock`.</rule>
-<rule number="5" importance="critical">Test repository methods in isolation, mocking any database interactions.</rule>
-<rule number="6" importance="high">Write a separate test method for each public method in the repository.</rule>
-<rule number="7" importance="critical">Include all necessary imports. The target class is `import {target_package_name}.{target_class_name};`.</rule>
-<rule number="8" importance="critical">Use `org.junit.jupiter.api.Assertions` for assertions.</rule>
-<rule number="9" importance="critical">Never use undefined variables, ambiguous types, or TODOs. Never use methods or fields not present in the context.</rule>
-<rule number="10" importance="critical">Always use the correct constructor and dependency injection style as in the source.</rule>
-<rule number="11" importance="critical">Never use ambiguous or generic types. Always use the exact types from the context.</rule>
-</rules>
-<context>
-<custom_imports_from_source>
-{formatted_custom_imports}
-</custom_imports_from_source>
-{dependency_context}
-<retrieved_source_code>
-{{context}}
-</retrieved_source_code>
-</context>
-<instructions>
-{additional_query_instructions}
-{STRICT_OUTPUT_INSTRUCTIONS}
-Provide ONLY the complete Java code block for the test class, enclosed in ```java ... ```.
-Do not include any explanations or conversational text.
-</instructions>
+You are an expert Java Spring Boot test generator. Your task is to generate a JUnit 5 test class for the repository `{target_class_name}` in the package `{target_package_name}`.
+
+STRICT REQUIREMENTS:
+- Output ONLY compilable Java code, no explanations or markdown.
+- Use JUnit 5 (`org.junit.jupiter.api.*`) and Mockito (`org.mockito.*`).
+- Import all required classes, including Spring annotations and Mockito utilities.
+- Use `@DataJpaTest` for repository tests.
+- Mock or provide test data as needed for repository methods.
+- For each public method in the repository, generate at least one test method that:
+    - Sets up the required data in the test database (use in-memory DB if possible).
+    - Asserts the results of repository methods using JUnit assertions.
+- Use descriptive test method names (e.g., `shouldReturnXWhenY`).
+- Include all necessary setup (e.g., `@BeforeEach` if needed).
+- Do NOT hallucinate methods or imports—use only what is present in the provided context and imports.
+- Always include `{custom_imports}` in the import section.
+- {additional_query_instructions}
+- If any dependencies or utility classes are required, use only those present in the context.
+- The output must be a single, compilable Java test class.
 """ 

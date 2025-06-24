@@ -43,7 +43,7 @@ class JavaTestRunner:
         )
         # Regex for assertion errors
         assertion_pattern = re.compile(r"expected:\s*(.+?)\s*but was:\s*(.+)", re.IGNORECASE)
-
+        
         # Check for compilation errors first (from both stdout and stderr)
         for line in (stdout + stderr).splitlines():
             match_comp_error = compilation_error_pattern.search(line)
@@ -97,7 +97,7 @@ class JavaTestRunner:
                 if match_general_comp:
                     if not any(match_general_comp.group(1) in e['message'] for e in errors["compilation_errors"]):
                         errors["general_messages"].append(match_general_comp.group(1).strip())
-
+        
         # Test failure parsing (extract method, class, type, message, stack, expected/actual, suggested fix)
         test_failure_method_pattern = re.compile(r"\[ERROR\]\s+([\w.$]+)\(([\w.$]+)\)\s+Time elapsed:[\d.]+ s\s+<<< (?:FAILURE|ERROR)!?\s*\n(?P<exception_type>[a-zA-Z0-9_\.$]+(?:Exception|Error|Failure)?):?\s*(?P<message>.*?(?=\n\s+at|\n\s*\w+\.[\w.$]+:))", re.MULTILINE | re.DOTALL)
         for match in test_failure_method_pattern.finditer(stdout):
@@ -176,7 +176,7 @@ class JavaTestRunner:
 
             status = "UNKNOWN"
             message = "An unexpected Maven execution state occurred."
-            
+
             if return_code == 0 and "BUILD SUCCESS" in stdout:
                 # Look for test results summary (common in Maven output)
                 test_summary_match = re.search(r"Tests run: (\d+), Failures: (\d+), Errors: (\d+), Skipped: (\d+)", stdout)
@@ -262,7 +262,7 @@ class JavaTestRunner:
                 "general_messages": []
             }
             if "BUILD FAILED" in stdout or "BUILD FAILED" in stderr:
-                detailed_errors["general_messages"].append("Gradle build failed. Check stdout/stderr for details.")
+                    detailed_errors["general_messages"].append("Gradle build failed. Check stdout/stderr for details.")
                 # You can add regex here later to parse specific Gradle errors.
             
             status = "UNKNOWN"

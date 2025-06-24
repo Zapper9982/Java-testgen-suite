@@ -218,6 +218,12 @@ def semantic_chunk_documents(docs: List[Document], chunker: SemanticChunker) -> 
     return chunker.split_documents(docs)
 
 
+def get_last_n_lines(text, n):
+    return '\n'.join(text.strip().splitlines()[-n:]) if text else ''
+
+def get_first_n_lines(text, n):
+    return '\n'.join(text.strip().splitlines()[:n]) if text else ''
+
 def process_codebase_from_txt_for_chunking(input_dir: Path, output_json_path: Path) -> List[Dict[str, Any]]:
 
     all_final_chunks: List[Dict[str, Any]] = []
@@ -279,6 +285,7 @@ def process_codebase_from_txt_for_chunking(input_dir: Path, output_json_path: Pa
             parsed_java_data = parse_java_code_with_metadata(content, original_filename_base)
             
 
+            # --- Hierarchical Chunking: Class header, then method groups, then large methods ---
             if parsed_java_data["class_header_content"]:
                 class_header_content = parsed_java_data["class_header_content"]
                 class_header_metadata = common_metadata_base.copy()
@@ -286,11 +293,9 @@ def process_codebase_from_txt_for_chunking(input_dir: Path, output_json_path: Pa
                     "type": "java_class_header",
                     "class_name": parsed_java_data["class_name"],
                     "class_annotations": ", ".join(parsed_java_data["class_annotations"]) if parsed_java_data["class_annotations"] else "",
-                    "fields": json.dumps(parsed_java_data["fields"]) # Store fields as JSON string
+                    "fields": json.dumps(parsed_java_data["fields"])
                 })
-               
                 if len(class_header_content) > LARGE_JAVA_CHUNK_THRESHOLD and USE_LANGCHAIN_REC_SPLITTER:
-                    print(f"Applying semantic chunking to large class header from {filepath_txt.name}.")
                     temp_doc = Document(page_content=class_header_content, metadata=class_header_metadata)
                     semantically_split_docs = semantic_chunk_documents([temp_doc], global_semantic_chunker)
                     for doc in semantically_split_docs:
@@ -298,74 +303,57 @@ def process_codebase_from_txt_for_chunking(input_dir: Path, output_json_path: Pa
                             all_final_chunks.append({
                                 "chunk_id": uuid.uuid4().hex,
                                 "chunk_content": doc.page_content,
-                                "chunk_metadata": doc.metadata # Renamed to chunk_metadata
+                                "chunk_metadata": doc.metadata
                             })
-                            chunk_type_counts[doc.metadata.get("type", "java_class_header_semantic")] = chunk_type_counts.get(doc.metadata.get("type", "java_class_header_semantic"), 0) + 1
-                        else:
-                            print(f"Skipping tiny semantic sub-chunk from {filepath_txt.name} (class header). Length: {len(doc.page_content)}")
                 else:
                     if len(class_header_content) >= MIN_CHUNK_CONTENT_LENGTH:
                         all_final_chunks.append({
                             "chunk_id": uuid.uuid4().hex,
                             "chunk_content": class_header_content,
-                            "chunk_metadata": class_header_metadata # Renamed to chunk_metadata
+                            "chunk_metadata": class_header_metadata
                         })
-                        chunk_type_counts[class_header_metadata.get("type", "java_class_header")] = chunk_type_counts.get(class_header_metadata.get("type", "java_class_header"), 0) + 1
-                    else:
-                        print(f"Skipping tiny class header chunk from {filepath_txt.name}. Length: {len(class_header_content)}")
 
-
-            # --- Subsequent Chunks: Grouped Methods ---
-            current_method_group_content = ""
-            current_method_group_method_names = [] # To store names of methods in this group
-            
+            # --- Method-level and group chunking with overlap ---
+            method_chunks = []
+            overlap_lines = 8
             for i, method_data in enumerate(parsed_java_data["methods"]):
                 method_content = method_data["content"]
-                
-                # Append method content and metadata to current group
-                current_method_group_content += method_content + "\n\n" # Add separators
-                current_method_group_method_names.append(method_data["method_name"])
-
-                # If current group exceeds threshold or it's the last method
-                if len(current_method_group_content) > METHOD_GROUP_MAX_CHARS or i == len(parsed_java_data["methods"]) - 1:
-                    # Create a single metadata for the combined chunk
-                    combined_metadata = common_metadata_base.copy()
-                    combined_metadata.update({
-                        "type": "java_method_group",
-                        "class_name": parsed_java_data["class_name"],
-                        "method_count": len(current_method_group_method_names),
-                        "methods_in_group": ", ".join(current_method_group_method_names) # Joined method names
-                    })
-
-                    # Apply semantic chunking if the combined method group is very large
-                    if len(current_method_group_content) > LARGE_JAVA_CHUNK_THRESHOLD and USE_LANGCHAIN_REC_SPLITTER:
-                        print(f"Applying semantic chunking to large method group from {filepath_txt.name}.")
-                        temp_doc = Document(page_content=current_method_group_content, metadata=combined_metadata)
-                        semantically_split_docs = semantic_chunk_documents([temp_doc], global_semantic_chunker)
-                        for doc in semantically_split_docs:
-                            if len(doc.page_content) >= MIN_CHUNK_CONTENT_LENGTH:
-                                all_final_chunks.append({
-                                    "chunk_id": uuid.uuid4().hex,
-                                    "chunk_content": doc.page_content,
-                                    "chunk_metadata": doc.metadata # Renamed to chunk_metadata
-                                })
-                                chunk_type_counts[doc.metadata.get("type", "java_method_group_semantic")] = chunk_type_counts.get(doc.metadata.get("type", "java_method_group_semantic"), 0) + 1
-                            else:
-                                print(f"Skipping tiny semantic sub-chunk from {filepath_txt.name} (method group). Length: {len(doc.page_content)}")
-                    else:
-                        if len(current_method_group_content) >= MIN_CHUNK_CONTENT_LENGTH:
-                            all_final_chunks.append({
+                method_metadata = common_metadata_base.copy()
+                method_metadata.update({
+                    "type": "java_method",
+                    "class_name": parsed_java_data["class_name"],
+                    "method_name": method_data["method_name"],
+                    "annotations": ", ".join(method_data["annotations"]),
+                    "parameters": method_data["parameters"],
+                    "return_type": method_data["return_type"],
+                    "start_char": method_data["start_char"],
+                    "end_char": method_data["end_char"]
+                })
+                # For very large/complex methods, chunk further
+                if len(method_content) > LARGE_JAVA_CHUNK_THRESHOLD and USE_LANGCHAIN_REC_SPLITTER:
+                    temp_doc = Document(page_content=method_content, metadata=method_metadata)
+                    semantically_split_docs = semantic_chunk_documents([temp_doc], global_semantic_chunker)
+                    for doc in semantically_split_docs:
+                        if len(doc.page_content) >= MIN_CHUNK_CONTENT_LENGTH:
+                            method_chunks.append({
                                 "chunk_id": uuid.uuid4().hex,
-                                "chunk_content": current_method_group_content.strip(), # Trim final whitespace
-                                "chunk_metadata": combined_metadata # Renamed to chunk_metadata
+                                "chunk_content": doc.page_content,
+                                "chunk_metadata": doc.metadata
                             })
-                            chunk_type_counts[combined_metadata.get("type", "java_method_group")] = chunk_type_counts.get(combined_metadata.get("type", "java_method_group"), 0) + 1
-                        else:
-                            print(f"Skipping tiny method group chunk from {filepath_txt.name}. Length: {len(current_method_group_content)}")
-                    
-                    # Reset for the next group
-                    current_method_group_content = ""
-                    current_method_group_method_names = []
+                else:
+                    if len(method_content) >= MIN_CHUNK_CONTENT_LENGTH:
+                        method_chunks.append({
+                            "chunk_id": uuid.uuid4().hex,
+                            "chunk_content": method_content,
+                            "chunk_metadata": method_metadata
+                        })
+            # Add overlap between method chunks
+            for idx, chunk in enumerate(method_chunks):
+                if idx > 0:
+                    prev_chunk = method_chunks[idx-1]
+                    overlap = get_last_n_lines(prev_chunk["chunk_content"], overlap_lines)
+                    chunk["chunk_content"] = overlap + '\n' + chunk["chunk_content"]
+            all_final_chunks.extend(method_chunks)
 
 
         elif inferred_type == 'config':
