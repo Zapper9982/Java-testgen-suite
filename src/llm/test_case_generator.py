@@ -222,6 +222,82 @@ class TestCaseGenerator:
                 target_class_name, target_package_name, custom_imports, additional_query_instructions, dependency_signatures
             )
 
+    def generate_test_plan(self, target_class_name: str, class_code: str) -> List[Dict[str, str]]:
+        """
+        Step 1: Ask the LLM to generate a test plan (method names + descriptions) for the class.
+        Returns a list of dicts: [{"method_name": ..., "description": ...}, ...]
+        """
+        plan_prompt = f"""
+You are an expert Java test designer. Given the following class, list all public methods and, for each, describe the test cases you would write. For each test case, provide:
+- The test method name (e.g., shouldReturnXWhenY)
+- A one-sentence description of what it tests (including edge cases, exceptions, etc.)
+
+Do NOT output any code, just a structured test plan in this format:
+Test method: <methodName>
+Description: <description>
+
+--- BEGIN CLASS UNDER TEST ---
+{class_code}
+--- END CLASS UNDER TEST ---
+"""
+        print("\n--- DEBUG: TEST PLAN PROMPT ---\n" + plan_prompt + "\n--- END TEST PLAN PROMPT ---\n")
+        # Use LLM directly (not RetrievalQA)
+        result = self.llm.invoke(plan_prompt)
+        if hasattr(result, "content"):
+            result = result.content
+        print("\n--- DEBUG: TEST PLAN OUTPUT ---\n" + result + "\n--- END TEST PLAN OUTPUT ---\n")
+        # Parse the output into a list of test cases
+        test_cases = []
+        for block in result.split("Test method:"):
+            lines = block.strip().splitlines()
+            if not lines or not lines[0].strip():
+                continue
+            method_name = lines[0].strip()
+            description = ""
+            for l in lines[1:]:
+                if l.lower().startswith("description:"):
+                    description = l[len("description:"):].strip()
+            if method_name:
+                test_cases.append({"method_name": method_name, "description": description})
+        return test_cases
+
+    def generate_test_method(self, target_class_name: str, class_code: str, test_case: Dict[str, str], custom_imports: List[str], test_type: str, error_feedback: str = None) -> str:
+        """
+        Step 2: For each test case, generate the test method code using a focused prompt.
+        Optionally, provide error feedback for retry/fix attempts.
+        """
+        imports_section = '\n'.join(custom_imports) if custom_imports else ''
+        method_prompt = f"""
+You are an expert Java test writer. Write a JUnit5+Mockito test method for the following scenario.
+
+Class under test:
+{class_code}
+
+Test method name: {test_case['method_name']}
+Description: {test_case['description']}
+
+STRICT REQUIREMENTS:
+- Output ONLY the Java test method code, no explanations or markdown.
+- Use Mockito for mocking dependencies.
+- Use JUnit5 assertions.
+- Do NOT repeat the class under test.
+- Use the following imports if needed:
+{imports_section}
+"""
+        if error_feedback:
+            method_prompt += f"\n--- ERROR FEEDBACK FROM PREVIOUS ATTEMPT ---\n{error_feedback}\n--- END ERROR FEEDBACK ---\n"
+        print(f"\n--- DEBUG: TEST METHOD PROMPT for {test_case['method_name']} ---\n" + method_prompt + "\n--- END TEST METHOD PROMPT ---\n")
+        result = self.llm.invoke(method_prompt)
+        if hasattr(result, "content"):
+            result = result.content
+        print(f"\n--- DEBUG: TEST METHOD OUTPUT for {test_case['method_name']} ---\n" + result + "\n--- END TEST METHOD OUTPUT ---\n")
+        # Extract code block if present
+        code = result.strip()
+        if "```" in code:
+            code = code.split("```", 2)[1]
+            if code.startswith("java"): code = code[len("java"):].strip()
+        return code
+
     def generate_test_case(self, 
                            target_class_name: str, 
                            target_package_name: str, 
@@ -232,183 +308,137 @@ class TestCaseGenerator:
                            requires_db_test: bool,
                            dependency_signatures: Dict[str, str] = None,
                            target_info: Dict[str, Any] = None) -> str:
-        # --- Context Chunk Trimming Logic ---
-        k = min(30, 5 + 2 * len(relevant_java_files_for_context))
-        context_trimmed = False
-        while True:
-            self._update_retriever_filter(relevant_java_files_for_context, k_override=k)
-            test_type = self._detect_test_type(target_info or {})
-            print(f"Generating {test_type.upper()} test for {target_class_name}...")
-            base_template = self._get_prompt_template(
-                test_type, target_class_name, target_package_name, custom_imports,
-                additional_query_instructions, dependency_signatures
-            )
+        # --- Two-step approach for service/controller/repository ---
+        test_type = self._detect_test_type(target_info or {})
+        if test_type in ("service", "controller", "repository"):
+            self._update_retriever_filter(relevant_java_files_for_context, k_override=10)
+            retrieved_docs = self.retriever.get_relevant_documents(f"Full code for {target_class_name}")
+            class_code = "\n\n".join([doc.page_content for doc in retrieved_docs if target_class_name in doc.page_content])
+            if not class_code:
+                class_code = "\n\n".join([doc.page_content for doc in retrieved_docs])
+            test_plan = self.generate_test_plan(target_class_name, class_code)
+            if not test_plan:
+                print("[ERROR] LLM did not return a valid test plan. Aborting test generation.")
+                return ""
+            test_methods = []
+            method_errors = {}
+            for test_case in test_plan:
+                error_feedback = None
+                for attempt in range(MAX_TEST_GENERATION_RETRIES):
+                    method_code = self.generate_test_method(target_class_name, class_code, test_case, custom_imports, test_type, error_feedback=error_feedback)
+                    # Assemble a temporary test class with all previous methods + this one
+                    imports_section = '\n'.join(custom_imports) if custom_imports else ''
+                    temp_test_class_code = f"""
+package {target_package_name};
 
-            # Estimate token count for prompt template and user query (before context)
-            static_prompt_tokens = estimate_token_count(base_template + f"Generate tests for {target_class_name}.")
-            print(f"[Token Estimation] Static prompt (template + query): ~{static_prompt_tokens} tokens")
+{imports_section}
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.InjectMocks;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+import static org.mockito.Mockito.*;
+import static org.junit.jupiter.api.Assertions.*;
 
-            # Retrieve context chunks (simulate by fetching from retriever)
-            # We'll get the actual context when calling the QA chain, but we can estimate here
-            # For now, just estimate based on k and average chunk size (assume 1000 chars per chunk)
-            avg_chunk_chars = 1000
-            context_tokens = (k * avg_chunk_chars) // 4
-            total_estimated_tokens = static_prompt_tokens + context_tokens
-            print(f"[Token Estimation] With k={k}, estimated total tokens: ~{total_estimated_tokens}")
-
-            if total_estimated_tokens > MAX_TOTAL_TOKENS and k > MIN_K:
-                print(f"[Token Estimation] Exceeds {MAX_TOTAL_TOKENS} tokens. Reducing k and retrying...")
-                k = max(MIN_K, k - 2)
-                context_trimmed = True
-                continue
-            break
-        if context_trimmed:
-            print(f"[Token Estimation] Final k after trimming: {k}")
-
-        generated_code = ""
-        for retry_attempt in range(MAX_TEST_GENERATION_RETRIES):
-            print(f"\nAttempt {retry_attempt + 1}/{MAX_TEST_GENERATION_RETRIES} for test generation for {target_class_name}...")
-            
-            # Construct the prompt for the current attempt
-            current_prompt_query = f"Generate tests for {target_class_name}."
-            # Retrieve relevant code chunks for context
-            retrieved_docs = self.retriever.get_relevant_documents(current_prompt_query)
-            retrieved_code = "\n\n".join([doc.page_content for doc in retrieved_docs])
-            # --- Unified context construction ---
-            context_parts = [base_template, retrieved_code]
-            if retry_attempt > 0 and self.last_test_run_results:
-                def escape_curly_braces(s):
-                    return s.replace('{', '{{').replace('}', '}}') if s else s
-                stdout_content = escape_curly_braces(self.last_test_run_results.get('stdout', ''))
-                stderr_content = escape_curly_braces(self.last_test_run_results.get('stderr', ''))
-                detailed_feedback = ""
-                if self.last_test_run_results.get('detailed_errors'):
-                    comp_errors = self.last_test_run_results['detailed_errors'].get('compilation_errors', [])
-                    test_failures = self.last_test_run_results['detailed_errors'].get('test_failures', [])
-                    general_msgs = self.last_test_run_results['detailed_errors'].get('general_messages', [])
-                    if comp_errors:
-                        detailed_feedback += "\n--- COMPILATION ERRORS ---\n"
-                        for err in comp_errors:
-                            detailed_feedback += f"File: {escape_curly_braces(str(err.get('file', 'N/A')))}, Line: {escape_curly_braces(str(err.get('line', 'N/A')))}, Col: {escape_curly_braces(str(err.get('column', 'N/A')))}, Message: {escape_curly_braces(str(err.get('message', 'N/A')))}\n"
-                    if test_failures:
-                        detailed_feedback += "\n--- TEST FAILURES ---\n"
-                        for failure in test_failures:
-                            detailed_feedback += f"Summary: {escape_curly_braces(str(failure.get('summary', 'N/A')))}\n"
-                            for detail in failure.get('details', []):
-                                detailed_feedback += f"  - {escape_curly_braces(str(detail))}\n"
-                    if general_msgs:
-                        detailed_feedback += "\n--- GENERAL BUILD MESSAGES ---\n"
-                        for msg in general_msgs:
-                            detailed_feedback += f"  - {escape_curly_braces(str(msg))}\n"
-                error_feedback_message = (
-                    "\n\n--- PREVIOUS ATTEMPT FEEDBACK ---\n"
-                    f"The previously generated test for `{target_class_name}` encountered the following issue:\n"
-                    f"Status: {escape_curly_braces(self.last_test_run_results.get('status', 'N/A'))}\n"
-                    f"Message: {escape_curly_braces(self.last_test_run_results.get('message', 'N/A'))}\n"
-                    f"{detailed_feedback}"
-                    f"Full STDOUT (truncated):\n{stdout_content[:2000]}...\n"
-                    f"Full STDERR (truncated):\n{stderr_content[:2000]}...\n"
-                    f"Please analyze the errors/failures and revise the test code to fix them."
-                    f"Ensure you still adhere to all original instructions (Mockito usage, coverage, imports, etc.)."
-                    f"\n--- END PREVIOUS ATTEMPT FEEDBACK ---\n"
-                )
-                # DEBUG: Print the error feedback context being sent
-                print("\n--- DEBUG: ERROR FEEDBACK CONTEXT SENT TO LLM ---")
-                print(error_feedback_message[:3000])  # Print up to 3000 chars for readability
-                print("--- END ERROR FEEDBACK CONTEXT DEBUG ---\n")
-                context_parts.append(error_feedback_message)
-            # Join all context parts
-            full_context = '\n'.join(context_parts)
-            # DEBUG: Print the actual context/code being sent to the LLM
-            print("\n--- DEBUG: CONTEXT SENT TO LLM FOR TEST GENERATION ---")
-            print(full_context[:5000])  # Print up to 5000 chars for readability
-            print("--- END CONTEXT DEBUG ---\n")
-            # Use a safe PromptTemplate with only {context}
-            QA_CHAIN_PROMPT = PromptTemplate(
-                input_variables=["context"],
-                template="""
-<context>
-{context}
-</context>
+@ExtendWith(MockitoExtension.class)
+class {target_class_name}Test {{
+{chr(10).join(test_methods + [method_code])}
+}}
 """
-            )
-            # Initialize or update the QA chain with the safe prompt
-            if self.qa_chain:
-                self.qa_chain.combine_documents_chain.llm_chain.prompt = QA_CHAIN_PROMPT
+                    # Write to file and try to compile/run
+                    os.makedirs(test_output_file_path.parent, exist_ok=True)
+                    with open(test_output_file_path, 'w', encoding='utf-8') as f:
+                        f.write(temp_test_class_code)
+                    test_run_results = self.java_test_runner.run_test(test_output_file_path)
+                    if test_run_results["status"] == "SUCCESS":
+                        test_methods.append(method_code)
+                        break
+                    else:
+                        # Prepare error feedback for next attempt
+                        detailed_feedback = ""
+                        if test_run_results.get('detailed_errors'):
+                            comp_errors = test_run_results['detailed_errors'].get('compilation_errors', [])
+                            test_failures = test_run_results['detailed_errors'].get('test_failures', [])
+                            general_msgs = test_run_results['detailed_errors'].get('general_messages', [])
+                            if comp_errors:
+                                detailed_feedback += "\n--- COMPILATION ERRORS ---\n"
+                                for err in comp_errors:
+                                    detailed_feedback += f"File: {str(err.get('file', 'N/A'))}, Line: {str(err.get('line', 'N/A'))}, Col: {str(err.get('column', 'N/A'))}, Message: {str(err.get('message', 'N/A'))}\n"
+                            if test_failures:
+                                detailed_feedback += "\n--- TEST FAILURES ---\n"
+                                for failure in test_failures:
+                                    detailed_feedback += f"Summary: {str(failure.get('summary', 'N/A'))}\n"
+                                    for detail in failure.get('details', []):
+                                        detailed_feedback += f"  - {str(detail)}\n"
+                            if general_msgs:
+                                detailed_feedback += "\n--- GENERAL BUILD MESSAGES ---\n"
+                                for msg in general_msgs:
+                                    detailed_feedback += f"  - {str(msg)}\n"
+                        stdout_content = test_run_results.get('stdout', '')
+                        stderr_content = test_run_results.get('stderr', '')
+                        error_feedback = (
+                            f"Status: {test_run_results.get('status', 'N/A')}\n"
+                            f"Message: {test_run_results.get('message', 'N/A')}\n"
+                            f"{detailed_feedback}"
+                            f"Full STDOUT (truncated):\n{stdout_content[:2000]}...\n"
+                            f"Full STDERR (truncated):\n{stderr_content[:2000]}...\n"
+                            "Please revise the test method to fix these errors."
+                        )
+                        print(f"\n--- DEBUG: ERROR FEEDBACK FOR {test_case['method_name']} (Attempt {attempt+1}) ---\n{error_feedback}\n--- END ERROR FEEDBACK ---\n")
+                        if attempt == MAX_TEST_GENERATION_RETRIES - 1:
+                            print(f"[ERROR] Failed to generate a passing test method for {test_case['method_name']} after {MAX_TEST_GENERATION_RETRIES} attempts.")
+                            test_methods.append(method_code)  # Save the last attempt anyway
+            # Step 3: Assemble the final test class
+            imports_section = '\n'.join(custom_imports) if custom_imports else ''
+            test_class_code = f"""
+package {target_package_name};
+
+{imports_section}
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.InjectMocks;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+import static org.mockito.Mockito.*;
+import static org.junit.jupiter.api.Assertions.*;
+
+@ExtendWith(MockitoExtension.class)
+class {target_class_name}Test {{
+{chr(10).join(test_methods)}
+}}
+"""
+            # Write the generated test class to file
+            os.makedirs(test_output_file_path.parent, exist_ok=True)
+            with open(test_output_file_path, 'w', encoding='utf-8') as f:
+                f.write(test_class_code)
+            print(f"[TWO-STEP] Generated test class saved to: '{test_output_file_path}'")
+            print("\n--- FINAL GENERATED TEST CLASS (Two-Step) ---\n" + test_class_code + "\n" + "="*80 + "\n")
+            # Run the generated test as before
+            test_run_results = self.java_test_runner.run_test(test_output_file_path)
+            self.last_test_run_results = test_run_results
+            if test_run_results["status"] == "SUCCESS":
+                print(f"Test for {target_class_name} PASSED (two-step approach).")
+                return test_class_code
             else:
-                self.qa_chain = RetrievalQA.from_chain_type(
-                    llm=self.llm,
-                    chain_type="stuff",
-                    retriever=self.retriever,
-                    return_source_documents=True,
-                    chain_type_kwargs={"prompt": QA_CHAIN_PROMPT}
-                )
-            try:
-                result = self.qa_chain({"query": full_context})
-                response_text = result["result"]
-
-                # Extract code block
-                temp_generated_code = response_text.strip()
-                if "```java" in temp_generated_code:
-                    start_marker = "```java"
-                    end_marker = "```"
-                    start_index = temp_generated_code.find(start_marker)
-                    if start_index != -1:
-                        code_start = start_index + len(start_marker)
-                        code_end = temp_generated_code.find(end_marker, code_start)
-                        if code_end != -1:
-                            temp_generated_code = temp_generated_code[code_start:code_end].strip()
-                            if temp_generated_code.startswith("// Begin generated test code"):
-                                 temp_generated_code = temp_generated_code.replace("// Begin generated test code", "", 1).strip()
-                
-                if not temp_generated_code or temp_generated_code.lower().startswith("here is the"):
-                    print(f"LLM generated an incomplete or conversational response. Retrying...")
-                    self.last_test_run_results = {"status": "ERROR", "message": "LLM generated incomplete or conversational code.", "stdout": response_text, "stderr": "No executable code block found."}
-                    continue # Retry if LLM output is not a proper code block
-
-                generated_code = temp_generated_code # Store the extracted code
-
-                # Write the generated test case to a temporary file for execution
-                os.makedirs(test_output_file_path.parent, exist_ok=True)
-                with open(test_output_file_path, 'w', encoding='utf-8') as f:
-                    f.write(generated_code)
-                print(f"Temporarily saved test file for execution: {test_output_file_path}")
-
-                # Execute the generated test
-                test_run_results = self.java_test_runner.run_test(test_output_file_path)
-                self.last_test_run_results = test_run_results # Store for potential next iteration
-
-                if test_run_results["status"] == "SUCCESS":
-                    print(f"Test for {target_class_name} PASSED on attempt {retry_attempt + 1}.")
-                    return generated_code # Test passed, return the code
-                elif test_run_results["status"] == "FAILED" or test_run_results["status"] == "ERROR":
-                    print(f"Test for {target_class_name} FAILED/ERRORED on attempt {retry_attempt + 1}. Message: {test_run_results['message']}")
-                    # --- START MODIFICATION FOR DEBUGGING ---
-                    print("\n--- FULL STDOUT from Maven execution (for debugging) ---")
-                    print(test_run_results.get('stdout', '[No stdout available]'))
-                    print("\n--- FULL STDERR from Maven execution (for debugging) ---")
-                    print(test_run_results.get('stderr', '[No stderr available]'))
-                    # --- END MODIFICATION FOR DEBUGGING ---
-                    print("Feeding error feedback to LLM for next attempt...")
-                    # Loop continues for next retry
-                else: # UNKNOWN status
-                    print(f"Test for {target_class_name} returned UNKNOWN status on attempt {retry_attempt + 1}. Message: {test_run_results['message']}")
-                    # --- START MODIFICATION FOR DEBUGGING ---
-                    print("\n--- FULL STDOUT from Maven execution (for debugging) ---")
-                    print(test_run_results.get('stdout', '[No stdout available]'))
-                    print("\n--- FULL STDERR from Maven execution (for debugging) ---")
-                    print(test_run_results.get('stderr', '[No stderr available]'))
-                    # --- END MODIFICATION FOR DEBUGGING ---
-                    print("Feeding unknown status feedback to LLM for next RegEx...")
-                    # Loop continues for next retry
-
-            except Exception as e:
-                print(f"An error occurred during LLM call or test execution setup: {e}. Retrying...")
-                self.last_test_run_results = {"status": "ERROR", "message": f"Internal generation/execution error: {e}", "stdout": "", "stderr": str(e)}
-                # The loop will continue for the next retry attempt
-
-        print(f"Failed to generate a passing test for {target_class_name} after {MAX_TEST_GENERATION_RETRIES} attempts.")
-        return generated_code # Return the last generated code, even if it failed
+                print(f"Test for {target_class_name} FAILED/ERRORED (two-step approach). Message: {test_run_results['message']}")
+                print("\n--- FULL STDOUT from Maven execution (for debugging) ---")
+                print(test_run_results.get('stdout', '[No stdout available]'))
+                print("\n--- FULL STDERR from Maven execution (for debugging) ---")
+                print(test_run_results.get('stderr', '[No stderr available]'))
+                print("[TWO-STEP] Final test class still has errors after all retries.")
+                return test_class_code
+        # --- fallback: original approach for other types ---
+        return super().generate_test_case(
+            target_class_name=target_class_name,
+            target_package_name=target_package_name,
+            custom_imports=custom_imports,
+            relevant_java_files_for_context=relevant_java_files_for_context,
+            test_output_file_path=test_output_file_path,
+            additional_query_instructions=additional_query_instructions,
+            requires_db_test=requires_db_test,
+            dependency_signatures=dependency_signatures,
+            target_info=target_info
+        )
 
 if __name__ == "__main__":
     try:
