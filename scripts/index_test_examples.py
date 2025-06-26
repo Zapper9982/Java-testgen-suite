@@ -12,8 +12,8 @@ from chroma_db.chroma_client import get_chroma_client, get_or_create_collection
 PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
-SRC_MAIN_JAVA = Path("/Users/tanmay/Desktop/AMRIT/Common-API/src/main/java")
-SRC_TEST_JAVA = Path("/Users/tanmay/Desktop/AMRIT/Common-API/src/test/java")
+SRC_MAIN_JAVA = Path(os.getenv("SPRING_BOOT_PROJECT_PATH", ".")) / "src/main/java"
+SRC_TEST_JAVA = Path(os.getenv("SPRING_BOOT_PROJECT_PATH", ".")) / "src/test/java"
 CHROMA_COLLECTION = 'test_examples_collection'
 
 EMBEDDING_MODEL_NAME = 'BAAI/bge-small-en-v1.5'
