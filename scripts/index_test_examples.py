@@ -12,8 +12,8 @@ from chroma_db.chroma_client import get_chroma_client, get_or_create_collection
 PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
-SRC_MAIN_JAVA = Path("/Users/tanmay/Desktop/AMRIT/BeneficiaryID-Generation-API/src/main/java")
-SRC_TEST_JAVA = Path("/Users/tanmay/Desktop/AMRIT/BeneficiaryID-Generation-API/src/test/java")
+SRC_MAIN_JAVA = Path("/Users/tanmay/Desktop/AMRIT/Common-API/src/main/java")
+SRC_TEST_JAVA = Path("/Users/tanmay/Desktop/AMRIT/Common-API/src/test/java")
 CHROMA_COLLECTION = 'test_examples_collection'
 
 EMBEDDING_MODEL_NAME = 'BAAI/bge-small-en-v1.5'
@@ -82,7 +82,8 @@ def main():
     print("[RAG INDEX] Indexing complete.")
 
 def retrieve_similar_test_examples(class_code, method_signatures, vectorstore, top_n=3):
-    query_embedding = test_generator.embeddings.embed_documents([class_code + '\n' + '\n'.join(method_signatures)])[0]
+    embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME)
+    query_embedding = embeddings.embed_documents([class_code + '\n' + '\n'.join(method_signatures)])[0]
     results = vectorstore.similarity_search_by_vector(query_embedding, k=top_n, filter={'type': 'test_example'})
     return results  # Each result: {'page_content': ..., 'metadata': ...}
 

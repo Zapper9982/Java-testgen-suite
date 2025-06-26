@@ -579,6 +579,11 @@ def process_codebase_from_txt_for_chunking(input_dir: Path, output_json_path: Pa
                     print(f"Skipping tiny unclassified full file chunk from {filepath_txt.name}. Length: {len(content)}")
 
 
+    # Validation: Ensure every chunk has a 'type' in chunk_metadata
+    for chunk in all_final_chunks:
+        if "chunk_metadata" not in chunk or "type" not in chunk["chunk_metadata"]:
+            print(f"[ERROR] Chunk missing 'type' in metadata: {chunk}")
+
     # Save all chunks to a single JSON file
     os.makedirs(CHUNKED_OUTPUT_DIR, exist_ok=True) # Ensure output directory exists
     with open(output_json_path, 'w', encoding='utf-8') as out:

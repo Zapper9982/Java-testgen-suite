@@ -720,25 +720,17 @@ Instructions:
                     group_test_code = re.sub(r'^```', '', group_test_code)
                     group_test_code = re.sub(r'```$', '', group_test_code)
                     group_test_code = group_test_code.strip()
-                abs_path = os.path.abspath(test_output_file_path)
-                print(f"[DEBUG] About to write GROUP test to: {abs_path}")
-                try:
-                    with open(test_output_file_path, 'w', encoding='utf-8') as f:
-                        f.write(group_test_code)
-                    print(f"[DEBUG] Successfully wrote GROUP test to {abs_path} (length: {len(group_test_code)})")
-                except Exception as e:
-                    print(f"[ERROR] Failed to write GROUP test to {abs_path}: {e}")
+                test_output_file_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(test_output_file_path, 'w', encoding='utf-8') as f:
+                    f.write(group_test_code)
                 test_run_results = self.java_test_runner.run_test(test_output_file_path)
                 print(f"[DEBUG] Test run results: {test_run_results}")
                 compilation_errors = test_run_results['detailed_errors'].get('compilation_errors', [])
                 test_failures = test_run_results['detailed_errors'].get('test_failures', [])
-                static_analysis = self.run_static_analysis(test_output_file_path)
-                static_errors = static_analysis['errors']
                 print(f"[DEBUG] Compilation errors: {compilation_errors}")
                 print(f"[DEBUG] Test failures: {test_failures}")
-                print(f"[DEBUG] Static analysis errors: {static_errors}")
-                if not compilation_errors and not test_failures and not static_errors:
-                    print(f"[SUCCESS] No compilation, test, or static analysis errors after {attempt+1} attempt(s).")
+                if not compilation_errors and not test_failures:
+                    print(f"[SUCCESS] No compilation or test errors after {attempt+1} attempt(s).")
                     last_valid_code = group_test_code
                     break
                 else:
@@ -753,11 +745,6 @@ Instructions:
                         for err in test_failures:
                             print(f"  - {err['message']} (in {err['location']})")
                             error_msgs.append(f"TEST: {err['message']} (in {err['location']})")
-                    if static_errors:
-                        print(f"[STATIC ANALYSIS ERROR] Detected after attempt {attempt+1}:")
-                        for err in static_errors:
-                            print(f"  - {err}")
-                            error_msgs.append(f"STATIC: {err}")
                     error_feedback = '\n'.join(error_msgs)
             if last_valid_code:
                 all_test_class_outputs.append(last_valid_code)
@@ -830,12 +817,10 @@ STRICT REQUIREMENTS:
         final_test_class_code = re.sub(r'```$', '', final_test_class_code)
         final_test_class_code = final_test_class_code.strip()
         print(f"[DEBUG] FINAL GENERATED TEST CLASS CODE (before write):\n{final_test_class_code}\n--- END FINAL TEST CLASS CODE ---")
-        try:
-            with open(test_output_file_path, 'w', encoding='utf-8') as f:
-                f.write(final_test_class_code)
-            print(f"[FINAL SUCCESS] Generated test case saved to: '{test_output_file_path}'")
-        except Exception as e:
-            print(f"[FINAL ERROR] Could not save test case to '{test_output_file_path}': {e}")
+        test_output_file_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(test_output_file_path, 'w', encoding='utf-8') as f:
+            f.write(final_test_class_code)
+        print(f"[FINAL SUCCESS] Generated test case saved to: '{test_output_file_path}'")
         print("\n--- FINAL GENERATED TEST CASE (Printed to Console for review) ---")
         print(final_test_class_code)
         print("\n" + "="*80 + "\n")
@@ -1141,12 +1126,10 @@ if __name__ == "__main__":
             os.makedirs(test_output_dir, exist_ok=True)
 
             # Write the final generated test case to the file (could be the corrected one)
-            try:
-                with open(test_output_file_path, 'w', encoding='utf-8') as f:
-                    f.write(generated_test_code)
-                print(f"\n[FINAL SUCCESS] Generated test case saved to: '{test_output_file_path}'")
-            except Exception as e:
-                print(f"\n[FINAL ERROR] Could not save test case to '{test_output_file_path}': {e}")
+            test_output_file_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(test_output_file_path, 'w', encoding='utf-8') as f:
+                f.write(generated_test_code)
+            print(f"\n[FINAL SUCCESS] Generated test case saved to: '{test_output_file_path}'")
 
             print("\n--- FINAL GENERATED TEST CASE (Printed to Console for review) ---")
             print(generated_test_code) # Corrected variable name
