@@ -39,6 +39,16 @@ except Exception as e:
     print("Please ensure you have an active internet connection or the model is cached locally.")
     sys.exit(1)
 
+def sanitize_metadata(meta):
+    sanitized = {}
+    for k, v in meta.items():
+        if isinstance(v, list):
+            sanitized[k] = ', '.join(str(x) for x in v)
+        elif isinstance(v, dict):
+            sanitized[k] = json.dumps(v)
+        else:
+            sanitized[k] = v
+    return sanitized
 
 def embed_text(text: str, max_retries: int = 3, backoff: float = 1.0):
     """Encode text to a vector with retry/back‑off on OOM or HTTP errors."""
@@ -158,7 +168,7 @@ def main():
                 elif 'start_char' in meta: # Use character offset for method uniqueness within a class
                      chunk_specific_id += f"::offset::{meta['start_char']}"
 
-            elif chunk_type.startswith('config'):
+            elif chunk_type is not None and chunk_type.startswith('config'):
                 # For config, use a line/entry index or a hash of the content to ensure uniqueness
                 # Initialize counter for this file if not present
                 if base_filepath_id not in file_chunk_counters:
@@ -176,6 +186,8 @@ def main():
                     # Use a hash of the content itself, less ideal but ensures uniqueness
                     chunk_specific_id = f"text_chunk_hash::{hashlib.sha256(text.encode('utf-8')).hexdigest()[:8]}"
             else:
+                if chunk_type is None:
+                    print(f"[WARN] Chunk type is None for entry: {entry}")
                 # Fallback for any other unexpected chunk types or missing identifiers
                 # Use a combination of entry_idx_in_batch and overall chunk index 'i'
                 chunk_specific_id = f"generic_chunk::{i + entry_idx_in_batch}"
@@ -193,7 +205,7 @@ def main():
 
             batch_ids.append(uid)
             batch_embeddings.append(emb)
-            batch_metadatas.append(meta)
+            batch_metadatas.append(sanitize_metadata(meta))
             batch_documents.append(text)
         
         if batch_ids: # Only add if the batch is not empty

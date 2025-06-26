@@ -224,6 +224,98 @@ def get_last_n_lines(text, n):
 def get_first_n_lines(text, n):
     return '\n'.join(text.strip().splitlines()[:n]) if text else ''
 
+def generate_class_api_summary(class_code: str, class_name: str, package: str) -> str:
+    """
+    Generate a summary string listing the class name, package, all public/protected method signatures, and fields.
+    """
+    summary_lines = [f"Class: {package}.{class_name}" if package else f"Class: {class_name}"]
+    # Extract public/protected fields
+    field_pattern = re.compile(r'(public|protected)\s+([\w<>\[\]]+)\s+(\w+)\s*;')
+    fields = [f"- {m.group(1)} {m.group(2)} {m.group(3)}" for m in field_pattern.finditer(class_code)]
+    if fields:
+        summary_lines.append("Fields:")
+        summary_lines.extend(fields)
+    # Extract public/protected method signatures
+    method_pattern = re.compile(r'(public|protected)\s+([\w<>\[\]]+)\s+(\w+)\s*\(([^)]*)\)')
+    methods = [f"- {m.group(1)} {m.group(2)} {m.group(3)}({m.group(4)})" for m in method_pattern.finditer(class_code)]
+    if methods:
+        summary_lines.append("Methods:")
+        summary_lines.extend(methods)
+    return "\n".join(summary_lines)
+
+def extract_dependency_class_names(class_code: str) -> set:
+    """
+    Extracts all imported project class names from the class code.
+    """
+    # Only consider imports from the main project package (e.g., com.iemr.)
+    dep_pattern = re.compile(r'import\s+((com|org)\.[\w\.]+)\.(\w+);')
+    return set(m.group(3) for m in dep_pattern.finditer(class_code))
+
+def generate_dependency_api_summary(dep_class_names: set, all_loaded_files: list) -> str:
+    """
+    For each dependency class, find its code in all_loaded_files and extract its public/protected method signatures.
+    """
+    dep_summaries = []
+    for dep_class in dep_class_names:
+        for file_info in all_loaded_files:
+            if file_info["original_filename_base"] == dep_class and file_info["inferred_type"] == 'java':
+                code = file_info["content"]
+                # Extract public/protected method signatures
+                method_pattern = re.compile(r'(public|protected)\s+([\w<>\[\]]+)\s+(\w+)\s*\(([^)]*)\)')
+                methods = [f"- {m.group(1)} {m.group(2)} {m.group(3)}({m.group(4)})" for m in method_pattern.finditer(code)]
+                if methods:
+                    dep_summaries.append(f"Dependency: {dep_class}\n" + "\n".join(methods))
+                break
+    return "\n\n".join(dep_summaries) if dep_summaries else ""
+
+def collect_transitive_dependencies(class_code: str, all_loaded_files: list, seen: set = None) -> set:
+    """
+    Recursively collect all transitive dependency class names for a given class code.
+    """
+    if seen is None:
+        seen = set()
+    direct_deps = extract_dependency_class_names(class_code)
+    all_deps = set(direct_deps)
+    for dep_class in direct_deps:
+        if dep_class not in seen:
+            seen.add(dep_class)
+            for file_info in all_loaded_files:
+                if file_info["original_filename_base"] == dep_class and file_info["inferred_type"] == 'java':
+                    dep_code = file_info["content"]
+                    all_deps |= collect_transitive_dependencies(dep_code, all_loaded_files, seen)
+    return all_deps
+
+def extract_interfaces_and_superclass(class_code: str) -> set:
+    """
+    Extracts all interfaces and superclass names from the class declaration.
+    """
+    # Match 'class ClassName extends SuperClass implements Interface1, Interface2'
+    match = re.search(r'class\s+\w+\s*(?:extends\s+(\w+))?\s*(?:implements\s+([\w,\s]+))?', class_code)
+    interfaces = set()
+    superclass = set()
+    if match:
+        if match.group(1):
+            superclass.add(match.group(1).strip())
+        if match.group(2):
+            interfaces |= set(i.strip() for i in match.group(2).split(",") if i.strip())
+    return superclass | interfaces
+
+def generate_interface_superclass_api_summary(names: set, all_loaded_files: list) -> str:
+    """
+    For each interface/superclass, find its code and extract public/protected method signatures.
+    """
+    summaries = []
+    for name in names:
+        for file_info in all_loaded_files:
+            if file_info["original_filename_base"] == name and file_info["inferred_type"] == 'java':
+                code = file_info["content"]
+                method_pattern = re.compile(r'(public|protected)\s+([\w<>\[\]]+)\s+(\w+)\s*\(([^)]*)\)')
+                methods = [f"- {m.group(1)} {m.group(2)} {m.group(3)}({m.group(4)})" for m in method_pattern.finditer(code)]
+                if methods:
+                    summaries.append(f"Interface/Superclass: {name}\n" + "\n".join(methods))
+                break
+    return "\n\n".join(summaries) if summaries else ""
+
 def process_codebase_from_txt_for_chunking(input_dir: Path, output_json_path: Path) -> List[Dict[str, Any]]:
 
     all_final_chunks: List[Dict[str, Any]] = []
@@ -284,67 +376,115 @@ def process_codebase_from_txt_for_chunking(input_dir: Path, output_json_path: Pa
 
             parsed_java_data = parse_java_code_with_metadata(content, original_filename_base)
             
-
-            # --- Hierarchical Chunking: Class header, then method groups, then large methods ---
-            if parsed_java_data["class_header_content"]:
-                class_header_content = parsed_java_data["class_header_content"]
-                class_header_metadata = common_metadata_base.copy()
-                class_header_metadata.update({
-                    "type": "java_class_header",
-                    "class_name": parsed_java_data["class_name"],
-                    "class_annotations": ", ".join(parsed_java_data["class_annotations"]) if parsed_java_data["class_annotations"] else "",
-                    "fields": json.dumps(parsed_java_data["fields"])
+            # --- Class API Summary Chunk ---
+            package_match = re.search(r'package\s+([\w\.]+);', content)
+            package_name = package_match.group(1) if package_match else ""
+            class_api_summary = generate_class_api_summary(content, parsed_java_data["class_name"], package_name)
+            class_api_metadata = common_metadata_base.copy()
+            class_api_metadata.update({
+                "chunk_type": "class_api_summary",
+                "class_name": parsed_java_data["class_name"],
+                "package": package_name,
+                "method_list": [m["method_name"] for m in parsed_java_data["methods"]],
+                "field_list": [f["name"] for f in parsed_java_data["fields"]],
+            })
+            all_final_chunks.append({
+                "chunk_id": uuid.uuid4().hex,
+                "chunk_content": class_api_summary,
+                "chunk_metadata": class_api_metadata
+            })
+            # --- Transitive Dependency API Summary Chunk ---
+            trans_deps = collect_transitive_dependencies(content, loaded_txt_files)
+            trans_dep_api_summary = generate_dependency_api_summary(trans_deps, loaded_txt_files)
+            trans_dep_api_metadata = common_metadata_base.copy()
+            trans_dep_api_metadata.update({
+                "chunk_type": "transitive_dependency_api_summary",
+                "class_name": parsed_java_data["class_name"],
+                "transitive_dependencies": list(trans_deps)
+            })
+            if trans_dep_api_summary:
+                all_final_chunks.append({
+                    "chunk_id": uuid.uuid4().hex,
+                    "chunk_content": trans_dep_api_summary,
+                    "chunk_metadata": trans_dep_api_metadata
                 })
-                if len(class_header_content) > LARGE_JAVA_CHUNK_THRESHOLD and USE_LANGCHAIN_REC_SPLITTER:
-                    temp_doc = Document(page_content=class_header_content, metadata=class_header_metadata)
-                    semantically_split_docs = semantic_chunk_documents([temp_doc], global_semantic_chunker)
-                    for doc in semantically_split_docs:
-                        if len(doc.page_content) >= MIN_CHUNK_CONTENT_LENGTH:
-                            all_final_chunks.append({
-                                "chunk_id": uuid.uuid4().hex,
-                                "chunk_content": doc.page_content,
-                                "chunk_metadata": doc.metadata
-                            })
-                else:
-                    if len(class_header_content) >= MIN_CHUNK_CONTENT_LENGTH:
-                        all_final_chunks.append({
-                            "chunk_id": uuid.uuid4().hex,
-                            "chunk_content": class_header_content,
-                            "chunk_metadata": class_header_metadata
-                        })
-
+            # --- Interface/Superclass API Summary Chunk ---
+            iface_super_names = extract_interfaces_and_superclass(content)
+            iface_super_api_summary = generate_interface_superclass_api_summary(iface_super_names, loaded_txt_files)
+            iface_super_api_metadata = common_metadata_base.copy()
+            iface_super_api_metadata.update({
+                "chunk_type": "interface_superclass_api_summary",
+                "class_name": parsed_java_data["class_name"],
+                "interfaces_superclasses": list(iface_super_names)
+            })
+            if iface_super_api_summary:
+                all_final_chunks.append({
+                    "chunk_id": uuid.uuid4().hex,
+                    "chunk_content": iface_super_api_summary,
+                    "chunk_metadata": iface_super_api_metadata
+                })
             # --- Method-level and group chunking with overlap ---
             method_chunks = []
             overlap_lines = 8
+            method_list = [m["method_name"] for m in parsed_java_data["methods"]]
+            field_list = [f["name"] for f in parsed_java_data["fields"]]
             for i, method_data in enumerate(parsed_java_data["methods"]):
                 method_content = method_data["content"]
                 method_metadata = common_metadata_base.copy()
+                # Neighborhood: previous and next method names
+                prev_method = method_list[i-1] if i > 0 else None
+                next_method = method_list[i+1] if i+1 < len(method_list) else None
                 method_metadata.update({
-                    "type": "java_method",
+                    "chunk_type": "method",
                     "class_name": parsed_java_data["class_name"],
                     "method_name": method_data["method_name"],
                     "annotations": ", ".join(method_data["annotations"]),
                     "parameters": method_data["parameters"],
                     "return_type": method_data["return_type"],
                     "start_char": method_data["start_char"],
-                    "end_char": method_data["end_char"]
+                    "end_char": method_data["end_char"],
+                    "class_api_summary": class_api_summary, # Add summary to metadata
+                    "method_list": method_list,
+                    "field_list": field_list,
+                    "dependency_list": list(trans_deps),
+                    "dependency_api_summary": trans_dep_api_summary,
+                    "interface_superclass_api_summary": iface_super_api_summary,
+                    "neighborhood": {"prev": prev_method, "next": next_method},
+                    "related_chunks": {
+                        "class_api_summary": class_api_metadata.get("chunk_id"),
+                        "transitive_dependency_api_summary": trans_dep_api_metadata.get("chunk_id"),
+                        "interface_superclass_api_summary": iface_super_api_metadata.get("chunk_id"),
+                    }
                 })
-                # For very large/complex methods, chunk further
-                if len(method_content) > LARGE_JAVA_CHUNK_THRESHOLD and USE_LANGCHAIN_REC_SPLITTER:
-                    temp_doc = Document(page_content=method_content, metadata=method_metadata)
-                    semantically_split_docs = semantic_chunk_documents([temp_doc], global_semantic_chunker)
-                    for doc in semantically_split_docs:
-                        if len(doc.page_content) >= MIN_CHUNK_CONTENT_LENGTH:
-                            method_chunks.append({
-                                "chunk_id": uuid.uuid4().hex,
-                                "chunk_content": doc.page_content,
-                                "chunk_metadata": doc.metadata
-                            })
+                # Prepend all summaries to method chunk content
+                method_chunk_content = class_api_summary
+                if trans_dep_api_summary:
+                    method_chunk_content += "\n\n" + trans_dep_api_summary
+                if iface_super_api_summary:
+                    method_chunk_content += "\n\n" + iface_super_api_summary
+                method_chunk_content += "\n\n" + method_content
+                # For very large/complex methods, chunk further (every 50 lines)
+                lines = method_content.splitlines()
+                if len(lines) > 50:
+                    for start in range(0, len(lines), 50):
+                        sub_chunk_lines = lines[start:start+50]
+                        sub_chunk_content = method_data["method_name"] + " signature: " + method_data["parameters"] + "\n" + "\n".join(sub_chunk_lines)
+                        sub_chunk_full = class_api_summary
+                        if trans_dep_api_summary:
+                            sub_chunk_full += "\n\n" + trans_dep_api_summary
+                        if iface_super_api_summary:
+                            sub_chunk_full += "\n\n" + iface_super_api_summary
+                        sub_chunk_full += "\n\n" + sub_chunk_content
+                        method_chunks.append({
+                            "chunk_id": uuid.uuid4().hex,
+                            "chunk_content": sub_chunk_full,
+                            "chunk_metadata": method_metadata
+                        })
                 else:
                     if len(method_content) >= MIN_CHUNK_CONTENT_LENGTH:
                         method_chunks.append({
                             "chunk_id": uuid.uuid4().hex,
-                            "chunk_content": method_content,
+                            "chunk_content": method_chunk_content,
                             "chunk_metadata": method_metadata
                         })
             # Add overlap between method chunks
@@ -438,6 +578,11 @@ def process_codebase_from_txt_for_chunking(input_dir: Path, output_json_path: Pa
                 else:
                     print(f"Skipping tiny unclassified full file chunk from {filepath_txt.name}. Length: {len(content)}")
 
+
+    # Validation: Ensure every chunk has a 'type' in chunk_metadata
+    for chunk in all_final_chunks:
+        if "chunk_metadata" not in chunk or "type" not in chunk["chunk_metadata"]:
+            print(f"[ERROR] Chunk missing 'type' in metadata: {chunk}")
 
     # Save all chunks to a single JSON file
     os.makedirs(CHUNKED_OUTPUT_DIR, exist_ok=True) # Ensure output directory exists

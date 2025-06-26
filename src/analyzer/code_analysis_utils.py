@@ -30,6 +30,24 @@ def extract_custom_imports_from_chunk_file(processed_filepath_txt: Path) -> List
     
     return sorted(list(custom_imports))
 
+def extract_all_imports_from_java_file(java_file_path: Path) -> List[str]:
+    """
+    Extracts all import statements (project and external) from a Java file.
+    Returns a list of import strings (e.g., 'import org.slf4j.Logger;').
+    """
+    all_imports = set()
+    import_pattern = re.compile(r'^\s*import\s+([\w\.\*]+);', re.MULTILINE)
+    try:
+        with open(java_file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+            for match in import_pattern.findall(content):
+                all_imports.add(f"import {match};")
+    except FileNotFoundError:
+        print(f"WARNING: Java file not found: {java_file_path}")
+    except Exception as e:
+        print(f"ERROR: Could not read or parse imports from {java_file_path}: {e}")
+    return sorted(list(all_imports))
+
 class CodeAnalyser:
     """
     Analyzes a Java source file to identify its class name, package,
@@ -44,11 +62,11 @@ class CodeAnalyser:
     def analyze_dependencies(self, java_file_path: Path) -> Dict[str, Union[str, List[str]]]:
         """
         Analyzes a given Java file to extract class name, package name,
-        and infer its internal dependencies (filenames).
+        and infer its internal dependencies (filenames), and all imports.
         """
         if not java_file_path.exists():
             print(f"ERROR: Java source file not found for analysis: {java_file_path}")
-            return {"class_name": "N/A", "package_name": "N/A", "dependent_filenames": []}
+            return {"class_name": "N/A", "package_name": "N/A", "dependent_filenames": [], "all_imports": []}
 
         content = java_file_path.read_text(encoding='utf-8')
         
@@ -69,10 +87,13 @@ class CodeAnalyser:
             dependent_class_name = full_import_path.split('.')[-1]
             dependent_filenames.add(f"{dependent_class_name}.java")
         
+        all_imports = extract_all_imports_from_java_file(java_file_path)
+
         return {
             "class_name": class_name,
             "package_name": package_name,
-            "dependent_filenames": sorted(list(dependent_filenames))
+            "dependent_filenames": sorted(list(dependent_filenames)),
+            "all_imports": all_imports
         }
 
     def _detect_db_dependency_in_content(self, java_code: str, class_name: str) -> bool:
@@ -144,10 +165,11 @@ class SpringBootAnalyser:
                 # Filter here: Only process if it's explicitly a Service or Controller based on cleaned content
                 if is_service or is_controller:
                     
-                    analysis_result = self.code_analyser.analyze_dependencies(java_file_path) # analyze_dependencies uses original .java for imports
+                    analysis_result = self.code_analyser.analyze_dependencies(java_file_path)
                     class_name = analysis_result["class_name"]
                     package_name = analysis_result["package_name"]
                     dependent_filenames = analysis_result["dependent_filenames"]
+                    all_imports = analysis_result.get("all_imports", [])
 
                     custom_imports = extract_custom_imports_from_chunk_file(absolute_processed_txt_path)
 
@@ -169,6 +191,7 @@ class SpringBootAnalyser:
                         "package_name": package_name,
                         "dependent_filenames": dependent_filenames,
                         "custom_imports": custom_imports,
+                        "all_imports": all_imports,
                         "type": target_type, # Add the determined type
                         "requires_db_test": requires_db_test # Add the DB dependency flag
                     })
