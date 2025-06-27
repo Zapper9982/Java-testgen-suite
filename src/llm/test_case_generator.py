@@ -171,32 +171,24 @@ class TestCaseGenerator:
             raise ValueError("GOOGLE_API_KEY environment variable is not set. Cannot initialize Gemini LLM.")
         
         print(f"Using Google Gemini LLM: {LLM_MODEL_NAME_GEMINI}...")
-        return ChatGoogleGenerativeAI(model=LLM_MODEL_NAME_GEMINI, temperature=0.7)
+        return ChatGoogleGenerativeAI(model=LLM_MODEL_NAME_GEMINI, temperature=0.6)
 
-    def _update_retriever_filter(self, filenames: Union[str, List[str]], k_override: int = None):
+    def _update_retriever_filter(self, main_class_filename: str, dependency_filenames: List[str], utility_filenames: List[str] = None, k_override: int = None):
         """
-        Updates the retriever's filter to target a specific filename or a list of filenames.
-        This allows the retriever to fetch chunks from the target file and its dependencies.
-        Optionally, k_override can be used to force a lower k if token budget is exceeded.
+        Updates the retriever's filter to target only the main class, its direct dependencies, and utility files if actually imported.
+        Orders context as: main class, dependencies, utility files.
+        Sets a lower default k for focused retrieval.
         """
-        if isinstance(filenames, str):
-            filter_filenames = [filenames]
-        else:
-            filter_filenames = filenames 
-
-        # Always include test utility/config files
-        always_include = [
-            "BaseTest.java", "TestUtils.java", "application-test.yml", "application-test.properties"
-        ]
-        for util_file in always_include:
-            if util_file not in filter_filenames:
-                filter_filenames.append(util_file)
-
-        # Dynamically set k based on number of files, but allow override
-        k = min(30, 5 + 2 * len(filter_filenames))
+        filter_filenames = [main_class_filename] + dependency_filenames
+        if utility_filenames:
+            filter_filenames += utility_filenames
+        # Remove duplicates while preserving order
+        seen = set()
+        filter_filenames = [x for x in filter_filenames if not (x in seen or seen.add(x))]
+        # Set a lower k for focused context
+        k = min(5, len(filter_filenames))
         if k_override is not None:
             k = max(MIN_K, k_override)
-
         self.retriever = self.vectorstore.as_retriever(
             search_type="mmr",
             search_kwargs={
@@ -204,7 +196,6 @@ class TestCaseGenerator:
                 "filter": {"filename": {"$in": filter_filenames}}
             },
         )
-        # Update the QA chain with the new retriever if it's already initialized.
         if self.qa_chain:
             self.qa_chain.retriever = self.retriever
         print(f"Retriever filter updated to target filenames: '{filter_filenames}' (k={k})")
@@ -488,7 +479,7 @@ Instructions:
         print("\n--- RAW LLM WHOLE-CLASS OUTPUT (FULL) ---\n" + result + "\n--- END RAW LLM WHOLE-CLASS OUTPUT ---\n")
         return result.strip()
 
-    def generate_whole_class_test_with_feedback(self, target_class_name, target_package_name, class_code, public_methods, custom_imports, imports_context, feedback_msg, formatted_examples=None):
+    def generate_whole_class_test_with_feedback(self, target_class_name, target_package_name, class_code, public_methods, custom_imports, imports_context, feedback_msg, formatted_examples=None, previous_test_class_code=None):
         method_list_str = '\n'.join(f'- {m}' for m in public_methods)
         imports_section = '\n'.join(custom_imports) if custom_imports else ''
         strictness = (
@@ -500,12 +491,14 @@ Instructions:
             "You must generate a compiling, passing, and style-compliant test class."
         )
         prompt = ''
+        if feedback_msg:
+            prompt += f"{feedback_msg}\n\n"
+        if previous_test_class_code:
+            prompt += f"PREVIOUS TEST CASE OUTPUT:\n--- BEGIN PREVIOUS OUTPUT ---\n{previous_test_class_code}\n--- END PREVIOUS OUTPUT ---\n\n"
         if formatted_examples:
             prompt += f"// The following are real test examples from your codebase.\n{formatted_examples}\n\n"
         prompt += f"""
-{feedback_msg}
-
-You are an expert Java developer. You are to generate a complete JUnit 5 + Mockito test class for the MAIN CLASS below. The other classes are provided as context only (do NOT generate tests for them).
+You are an expert Java developer. You are to fix and regenerate a complete JUnit 5 + Mockito test class for the MAIN CLASS below. The other classes are provided as context only (do NOT generate tests for them).
 
 {imports_context}
 
@@ -525,11 +518,11 @@ Instructions:
 
 {strictness}
 """
-        print("\n--- WHOLE-CLASS TEST GENERATION PROMPT (WITH FEEDBACK, FULL) ---\n" + prompt + "\n--- END WHOLE-CLASS TEST GENERATION PROMPT ---\n")
+        # print("\n--- WHOLE-CLASS TEST GENERATION PROMPT (WITH FEEDBACK, FULL) ---\n" + prompt + "\n--- END WHOLE-CLASS TEST GENERATION PROMPT ---\n")
         result = self.llm.invoke(prompt)
         if hasattr(result, "content"):
             result = result.content
-        print("\n--- RAW LLM WHOLE-CLASS OUTPUT (WITH FEEDBACK, FULL) ---\n" + result + "\n--- END RAW LLM WHOLE-CLASS OUTPUT ---\n")
+        # print("\n--- RAW LLM WHOLE-CLASS OUTPUT (WITH FEEDBACK, FULL) ---\n" + result + "\n--- END RAW LLM WHOLE-CLASS OUTPUT ---\n")
         return result.strip()
 
     def generate_test_case(self, 
@@ -542,44 +535,28 @@ Instructions:
                            requires_db_test: bool,
                            dependency_signatures: Dict[str, str] = None,
                            target_info: Dict[str, Any] = None) -> str:
-        self._update_retriever_filter(relevant_java_files_for_context, k_override=10)
+        # --- NEW: Early exit if test file already exists ---
+        if test_output_file_path.exists():
+            print(f"[SKIP] Test file already exists (inside generate_test_case): '{test_output_file_path}'")
+            print(f"Skipping test generation for {target_class_name} (generate_test_case)")
+            return ""
+
+        # --- Retrieve the full class code for the main class under test (single assignment, guaranteed) ---
+        main_class_filename = Path(target_info['java_file_path_abs']).name if target_info else None
+        # [FIX] Handle relevant_java_files_for_context as a list of file paths (strings)
+        dependency_filenames = [Path(f).name for f in relevant_java_files_for_context if Path(f).name != main_class_filename]
+        utility_filenames = [Path(f).name for f in relevant_java_files_for_context if Path(f).name not in dependency_filenames and Path(f).name != main_class_filename]
+        self._update_retriever_filter(main_class_filename, dependency_filenames, utility_filenames, k_override=5)
         retrieved_docs = self.retriever.get_relevant_documents(f"Full code for {target_class_name}")
         class_code = "\n\n".join([doc.page_content for doc in retrieved_docs if target_class_name in doc.page_content])
         if not class_code:
             class_code = "\n\n".join([doc.page_content for doc in retrieved_docs])
-        public_methods = sorted(self.extract_public_methods(class_code))
-        
-        # --- Set retry limits ---
-        MAX_RETRIES = 15
-        max_feedback_retries = MAX_RETRIES
-        max_retries = MAX_RETRIES
-
-        print(f"[DEBUG] Starting test generation for: {target_class_name}")
-        print(f"[DEBUG] Output test file will be: {test_output_file_path}")
-        print(f"[DEBUG] Custom imports: {custom_imports}")
-        print(f"[DEBUG] Additional instructions: {additional_query_instructions}")
-        print(f"[DEBUG] Target info: {target_info}")
-
-        # --- Retrieve the full class code for the main class under test ---
-        print(f"[DEBUG] Fetching main class code for: {target_class_name}")
-        class_code = None
-        main_java_filename = None
-        if target_info and 'java_file_path_abs' in target_info:
-            main_java_filename = Path(target_info['java_file_path_abs']).name
-        if main_java_filename:
-            print(f"[DEBUG] Using ChromaDB retriever for file: {main_java_filename}")
-            self._update_retriever_filter([main_java_filename], k_override=20)
-            retrieved_docs = self.retriever.get_relevant_documents(f"Full code for {target_class_name}")
-            print(f"[DEBUG] Retrieved {len(retrieved_docs)} docs from ChromaDB for main class.")
-            for i, doc in enumerate(retrieved_docs):
-                print(f"[DEBUG] Main class chunk {i+1}:\n{doc.page_content[:500]}{'...' if len(doc.page_content) > 500 else ''}\n---")
-            class_code = "\n\n".join([doc.page_content for doc in retrieved_docs if target_class_name in doc.page_content])
-            if not class_code:
-                class_code = "\n\n".join([doc.page_content for doc in retrieved_docs])
-            print(f"[DEBUG] Loaded class code for {target_class_name} from ChromaDB chunks.")
-        else:
-            class_code = ""
+        if not class_code:
+            class_code = "// ERROR: Could not retrieve main class code from ChromaDB."
         print("\n[DEBUG] CLASS CODE SENT TO LLM (FULL):\n" + class_code + "\n[END DEBUG CLASS CODE]\n")
+
+        # [FIX] Extract public methods from class_code
+        public_methods = self.extract_public_methods(class_code)
 
         # --- Extract project-local imports and load their code as context from ChromaDB ---
         print(f"[DEBUG] Extracting and fetching imported class context for: {target_class_name}")
@@ -644,20 +621,22 @@ Instructions:
         # --- Automated feedback loop for hallucinated members ---
         feedback_attempt = 0
         hallucinated = set()
-        while feedback_attempt <= max_feedback_retries:
-            print(f"[DEBUG] Hallucination feedback loop attempt {feedback_attempt+1}")
+        previous_test_class_code = None
+        while feedback_attempt <= MAX_TEST_GENERATION_RETRIES:
+            # print(f"[DEBUG] Hallucination feedback loop attempt {feedback_attempt+1}")
             if feedback_attempt == 0:
                 test_class_code = self.generate_whole_class_test_with_context(target_class_name, target_package_name, class_code, public_methods, custom_imports, imports_context, formatted_examples)
             else:
-                test_class_code = self.generate_whole_class_test_with_feedback(target_class_name, target_package_name, class_code, public_methods, custom_imports, imports_context, feedback_msg, formatted_examples)
-            print(f"[DEBUG] LLM OUTPUT (hallucination check):\n{test_class_code}\n--- END LLM OUTPUT ---")
+                test_class_code = self.generate_whole_class_test_with_feedback(target_class_name, target_package_name, class_code, public_methods, custom_imports, imports_context, feedback_msg, formatted_examples, previous_test_class_code)
+            previous_test_class_code = test_class_code
+            # print(f"[DEBUG] LLM OUTPUT (hallucination check):\n{test_class_code}\n--- END LLM OUTPUT ---")
             hallucinated = self.find_hallucinated_members(test_class_code, imported_class_members)
-            print(f"[DEBUG] Hallucinated members found: {hallucinated}")
+            # print(f"[DEBUG] Hallucinated members found: {hallucinated}")
             if not hallucinated:
                 break
-            print(f"[FEEDBACK LOOP] Hallucinated members found: {hallucinated}. Re-prompting LLM with feedback.")
-            feedback_msg = ("WARNING: In your previous output, you used the following members which do NOT exist in the provided code: "
-                            f"{', '.join(hallucinated)}. Do NOT use these or any other non-existent members. Only use what is present in the code blocks below. If you hallucinate again, you will be penalized.")
+            # --- Stronger feedback for hallucination ---
+            feedback_msg = ("ERROR: In your previous output, you used the following members which do NOT exist in the provided code: "
+                            f"{', '.join(hallucinated)}. STRICTLY do NOT use these or any other non-existent members. Only use what is present in the code blocks below. If you hallucinate again, your output will be rejected and you will be penalized. If you are unsure, leave it out or add a comment.")
             feedback_attempt += 1
         test_class_code = test_class_code.strip()
         test_class_code = re.sub(r'^```[a-zA-Z]*\n', '', test_class_code)
@@ -677,7 +656,7 @@ Instructions:
         real_methods = sorted(public_methods)
         print(f"[DEBUG] Methods from static analysis: {real_methods}")
         retries = 0
-        while set(plan_methods) != set(real_methods) and retries < MAX_RETRIES:
+        while set(plan_methods) != set(real_methods) and retries < MAX_TEST_GENERATION_RETRIES:
             print(f"[TEST PLAN VALIDATION] Mismatch between LLM plan and real methods. Retrying with strict feedback.")
             print(f"  LLM plan methods: {plan_methods}")
             print(f"  Static analysis methods: {real_methods}")
@@ -709,22 +688,23 @@ Instructions:
             group_test_code = group_test_code.strip()
             error_feedback = None
             last_valid_code = None
-            for attempt in range(MAX_RETRIES):
+            for attempt in range(MAX_TEST_GENERATION_RETRIES):
                 print(f"[DEBUG] Test generation retry {attempt+1} for group: {group}")
                 if error_feedback and attempt > 0:
                     print(f"[LLM ERROR FEEDBACK] Feeding the following error message to LLM (attempt {attempt+1}):\n{error_feedback}\n--- END ERROR FEEDBACK ---")
-                    group_test_code = self.generate_whole_class_test_with_feedback(target_class_name, target_package_name, class_code, group, custom_imports, imports_context, error_feedback, formatted_examples)
+                    group_test_code = self.generate_whole_class_test_with_feedback(target_class_name, target_package_name, class_code, group, custom_imports, imports_context, error_feedback, formatted_examples, last_valid_code)
                     print(f"[DEBUG] RAW LLM OUTPUT (after feedback) for group {group}:\n{group_test_code}\n--- END RAW LLM OUTPUT ---")
                     group_test_code = group_test_code.strip()
                     group_test_code = re.sub(r'^```[a-zA-Z]*\n', '', group_test_code)
                     group_test_code = re.sub(r'^```', '', group_test_code)
                     group_test_code = re.sub(r'```$', '', group_test_code)
                     group_test_code = group_test_code.strip()
+                # Always overwrite the test file with the latest LLM output before running the test
                 test_output_file_path.parent.mkdir(parents=True, exist_ok=True)
                 with open(test_output_file_path, 'w', encoding='utf-8') as f:
                     f.write(group_test_code)
                 test_run_results = self.java_test_runner.run_test(test_output_file_path)
-                print(f"[DEBUG] Test run results: {test_run_results}")
+                # print(f"[DEBUG] Test run results: {test_run_results}")
                 compilation_errors = test_run_results['detailed_errors'].get('compilation_errors', [])
                 test_failures = test_run_results['detailed_errors'].get('test_failures', [])
                 print(f"[DEBUG] Compilation errors: {compilation_errors}")
@@ -749,7 +729,7 @@ Instructions:
             if last_valid_code:
                 all_test_class_outputs.append(last_valid_code)
             else:
-                print(f"[ERROR] Test generation failed for methods {group} after {MAX_RETRIES} attempts. See logs for details.")
+                print(f"[ERROR] Test generation failed for methods {group} after {MAX_TEST_GENERATION_RETRIES} attempts. See logs for details.")
         all_methods = []
         covered_methods = set()
         for code in all_test_class_outputs:
@@ -793,7 +773,7 @@ STRICT REQUIREMENTS:
 {chr(10).join(custom_imports)}
 - Do NOT invent or use any methods, fields, or classes not present in the provided code. If you hallucinate, you will be penalized.
 """
-                for attempt in range(MAX_RETRIES):
+                for attempt in range(MAX_TEST_GENERATION_RETRIES):
                     print(f"[LLM COVERAGE] Retry {attempt+1} for method: {real_method}")
                     print(f"[LLM COVERAGE] Prompt sent to LLM:\n{single_method_prompt}\n--- END PROMPT ---")
                     result = self.llm.invoke(single_method_prompt)
@@ -817,13 +797,11 @@ STRICT REQUIREMENTS:
         final_test_class_code = re.sub(r'```$', '', final_test_class_code)
         final_test_class_code = final_test_class_code.strip()
         print(f"[DEBUG] FINAL GENERATED TEST CLASS CODE (before write):\n{final_test_class_code}\n--- END FINAL TEST CLASS CODE ---")
-        test_output_file_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(test_output_file_path, 'w', encoding='utf-8') as f:
-            f.write(final_test_class_code)
-        print(f"[FINAL SUCCESS] Generated test case saved to: '{test_output_file_path}'")
-        print("\n--- FINAL GENERATED TEST CASE (Printed to Console for review) ---")
-        print(final_test_class_code)
-        print("\n" + "="*80 + "\n")
+        # --- Post-processing: Final hallucination check before accepting output ---
+        final_hallucinated = self.find_hallucinated_members(final_test_class_code, imported_class_members)
+        if final_hallucinated:
+            print(f"[FINAL CHECK] Hallucinated members still present: {final_hallucinated}. Output will be flagged for manual review.")
+            final_test_class_code = f"// WARNING: The following members may be hallucinated: {', '.join(final_hallucinated)}\n" + final_test_class_code
         return final_test_class_code
 
     def extract_public_methods(self, class_code: str) -> set:
@@ -1123,12 +1101,6 @@ if __name__ == "__main__":
                 target_info=target_info # Pass the target_info for test type detection
             )
             
-            os.makedirs(test_output_dir, exist_ok=True)
-
-            # Write the final generated test case to the file (could be the corrected one)
-            test_output_file_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(test_output_file_path, 'w', encoding='utf-8') as f:
-                f.write(generated_test_code)
             print(f"\n[FINAL SUCCESS] Generated test case saved to: '{test_output_file_path}'")
 
             print("\n--- FINAL GENERATED TEST CASE (Printed to Console for review) ---")

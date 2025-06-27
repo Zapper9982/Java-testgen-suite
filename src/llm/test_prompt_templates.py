@@ -38,6 +38,12 @@ NEGATIVE_EXAMPLE = '''
 
 STRICT_OUTPUT_INSTRUCTIONS = """
 Output ONLY a single compilable Java code block. If you cannot generate a test for any method, output a comment in the code explaining why. Never output explanations or text outside the code block.
+
+IMPORTANT ANTI-HALLUCINATION RULES:
+- Do NOT invent or use any methods, fields, classes, or helpers not present in the provided code.
+- Only use what is present in the provided code and imports.
+- If you are unsure, leave it out or add a comment.
+- If you hallucinate, you will be penalized and re-prompted.
 """
 
 def get_service_test_prompt_template(target_class_name, target_package_name, custom_imports, additional_query_instructions, dependency_signatures=None):
@@ -50,7 +56,7 @@ You are an expert Java Spring Boot test generator. Your task is to generate a JU
 
 STRICT REQUIREMENTS:
 - Output ONLY compilable Java code, no explanations or markdown.
-- Use JUnit 5 (`org.junit.jupiter.api.*`) and Mockito (`org.mockito.*`).
+- Use JUnit 5 (`org.junit.jupiter.api.*`) and Mockito (`org.mockito.*`) to write tests.
 - Import all required classes, including Spring annotations and Mockito utilities.
 - Use `@ExtendWith(MockitoExtension.class)` for Mockito support.
 - Mock all dependencies using `@Mock` and inject them using `@InjectMocks` (and `@Spy` if needed).
@@ -61,7 +67,11 @@ STRICT REQUIREMENTS:
     - Covers both typical and edge cases, including exception paths.
 - Use descriptive test method names (e.g., `shouldReturnXWhenY`).
 - Never instantiate dependencies manually—always use dependency injection and mocking.
-- Do NOT hallucinate methods or imports—use only what is present in the provided context and imports.
+- Do NOT hallucinate methods, fields, helpers, or imports—use only what is present in the provided context and imports.
+- Do NOT invent or use any methods, fields, classes, or helpers not present in the provided code.
+- Only use what is present in the provided code and imports.
+- If you are unsure, leave it out or add a comment.
+- If you hallucinate, you will be penalized and re-prompted.
 - Always include `{custom_imports}` in the import section.
 - {additional_query_instructions}
 - If any dependencies or utility classes are required, use only those present in the context.
@@ -158,6 +168,11 @@ class CookieUtilTest {{
 // You may use only the methods, fields, and dependencies present in this code and its imports.
 {{context}}
 --- END CLASS UNDER TEST ---
+
+ADDITIONAL INSTRUCTIONS:
+- If the method under test declares 'throws' exceptions, your test must handle them (e.g., with try/catch or appropriate test annotations).
+- Do NOT omit required exception handling. If you omit it, the code will not compile.
+- If you are unsure, add a try/catch block or use the appropriate JUnit annotation (e.g., assertThrows).
 """
 
 def get_controller_test_prompt_template(target_class_name, target_package_name, custom_imports, additional_query_instructions, dependency_signatures=None):
