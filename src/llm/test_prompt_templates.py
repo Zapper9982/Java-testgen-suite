@@ -173,6 +173,8 @@ ADDITIONAL INSTRUCTIONS:
 - If the method under test declares 'throws' exceptions, your test must handle them (e.g., with try/catch or appropriate test annotations).
 - Do NOT omit required exception handling. If you omit it, the code will not compile.
 - If you are unsure, add a try/catch block or use the appropriate JUnit annotation (e.g., assertThrows).
+
+# Add explicit logger verification instructions to all test generation prompt templates
 """
 
 def get_controller_test_prompt_template(target_class_name, target_package_name, custom_imports, additional_query_instructions, dependency_signatures=None):
