@@ -178,9 +178,7 @@ class TestCaseGenerator:
             raise ValueError("GOOGLE_API_KEY environment variable is not set. Cannot initialize Gemini LLM.")
         
         print(f"Using Google Gemini LLM: {LLM_MODEL_NAME_GEMINI}...")
-        # Use low temperature (0.1) for consistent, deterministic test generation
-        # Higher temperatures (0.6+) lead to more creative but less reliable output
-        return ChatGoogleGenerativeAI(model=LLM_MODEL_NAME_GEMINI, temperature=0.2)
+        return ChatGoogleGenerativeAI(model=LLM_MODEL_NAME_GEMINI, temperature=0.1)
 
     def _update_retriever_filter(self, main_class_filename: str, dependency_filenames: List[str], utility_filenames: List[str] = None, k_override: int = None):
         """
