@@ -1,3 +1,4 @@
+# NO-OP: Trigger reload for extract_public_methods visibility
 import sys
 from pathlib import Path
 import os
@@ -42,6 +43,12 @@ from langchain.prompts import PromptTemplate
 import torch 
 from llm import test_prompt_templates
 from chroma_db.chroma_client import get_chroma_client as get_chroma_client_examples, get_or_create_collection as get_or_create_collection_examples
+from llm.test_prompt_templates import (
+    get_controller_test_prompt_template,
+    get_service_test_prompt_template,
+    TEST_QUALITY_CHECK_PROMPT,
+    BEST_PRACTICES_EXAMPLE
+)
 
 
 # --- Google API Configuration ---
@@ -171,32 +178,24 @@ class TestCaseGenerator:
             raise ValueError("GOOGLE_API_KEY environment variable is not set. Cannot initialize Gemini LLM.")
         
         print(f"Using Google Gemini LLM: {LLM_MODEL_NAME_GEMINI}...")
-        return ChatGoogleGenerativeAI(model=LLM_MODEL_NAME_GEMINI, temperature=0.7)
+        return ChatGoogleGenerativeAI(model=LLM_MODEL_NAME_GEMINI, temperature=0.1)
 
-    def _update_retriever_filter(self, filenames: Union[str, List[str]], k_override: int = None):
+    def _update_retriever_filter(self, main_class_filename: str, dependency_filenames: List[str], utility_filenames: List[str] = None, k_override: int = None):
         """
-        Updates the retriever's filter to target a specific filename or a list of filenames.
-        This allows the retriever to fetch chunks from the target file and its dependencies.
-        Optionally, k_override can be used to force a lower k if token budget is exceeded.
+        Updates the retriever's filter to target only the main class, its direct dependencies, and utility files if actually imported.
+        Orders context as: main class, dependencies, utility files.
+        Sets a lower default k for focused retrieval.
         """
-        if isinstance(filenames, str):
-            filter_filenames = [filenames]
-        else:
-            filter_filenames = filenames 
-
-        # Always include test utility/config files
-        always_include = [
-            "BaseTest.java", "TestUtils.java", "application-test.yml", "application-test.properties"
-        ]
-        for util_file in always_include:
-            if util_file not in filter_filenames:
-                filter_filenames.append(util_file)
-
-        # Dynamically set k based on number of files, but allow override
-        k = min(30, 5 + 2 * len(filter_filenames))
+        filter_filenames = [main_class_filename] + dependency_filenames
+        if utility_filenames:
+            filter_filenames += utility_filenames
+        # Remove duplicates while preserving order
+        seen = set()
+        filter_filenames = [x for x in filter_filenames if not (x in seen or seen.add(x))]
+        # Set a lower k for focused context
+        k = min(5, len(filter_filenames))
         if k_override is not None:
             k = max(MIN_K, k_override)
-
         self.retriever = self.vectorstore.as_retriever(
             search_type="mmr",
             search_kwargs={
@@ -204,7 +203,6 @@ class TestCaseGenerator:
                 "filter": {"filename": {"$in": filter_filenames}}
             },
         )
-        # Update the QA chain with the new retriever if it's already initialized.
         if self.qa_chain:
             self.qa_chain.retriever = self.retriever
         print(f"Retriever filter updated to target filenames: '{filter_filenames}' (k={k})")
@@ -447,6 +445,7 @@ STRICT REQUIREMENTS:
         return None
 
     def generate_whole_class_test_with_context(self, target_class_name, target_package_name, class_code, public_methods, custom_imports, imports_context, formatted_examples=None):
+        print(f"[DEBUG] generate_whole_class_test_with_context called for {target_class_name}")
         method_list_str = '\n'.join(f'- {m}' for m in public_methods)
         imports_section = '\n'.join(custom_imports) if custom_imports else ''
         strictness = (
@@ -455,7 +454,13 @@ STRICT REQUIREMENTS:
             "If a method or field is not present in the provided code, do NOT use it in your test. "
             "If you are unsure, leave it out. "
             "If you hallucinate any code, you will be penalized and re-prompted. "
-            "You must generate a compiling, passing, and style-compliant test class."
+            "You must generate a compiling, passing, and style-compliant test class. "
+            "If the class or its methods use a logger (e.g., org.slf4j.Logger, log.info, log.error, etc.), write tests that verify logging behavior where appropriate. "
+            "Use Mockito or other suitable techniques to verify that logging statements are called as expected, especially for error or important info logs. "
+            "If you are unsure how to verify logging, add a comment in the test indicating what should be checked. "
+            "Generate tests for exception/negative paths (e.g., when repo throws). "
+            "Cover edge cases and all branches (e.g., with/without working location). "
+            "Do NOT define or create dummy DTOs, entities, or repository interfaces inside the test class. Use only the real classes provided in the context. If a class is missing, do NOT invent it—report an error instead."
         )
         prompt = ''
         if formatted_examples:
@@ -481,14 +486,15 @@ Instructions:
 
 {strictness}
 """
-        print("\n--- WHOLE-CLASS TEST GENERATION PROMPT (FULL) ---\n" + prompt + "\n--- END WHOLE-CLASS TEST GENERATION PROMPT ---\n")
+        print(f"[DEBUG] About to call LLM with prompt length: {len(prompt)} characters")
         result = self.llm.invoke(prompt)
+        print(f"[DEBUG] LLM call completed")
         if hasattr(result, "content"):
             result = result.content
-        print("\n--- RAW LLM WHOLE-CLASS OUTPUT (FULL) ---\n" + result + "\n--- END RAW LLM WHOLE-CLASS OUTPUT ---\n")
+        print(f"[DEBUG] Returning result with length: {len(result)} characters")
         return result.strip()
 
-    def generate_whole_class_test_with_feedback(self, target_class_name, target_package_name, class_code, public_methods, custom_imports, imports_context, feedback_msg, formatted_examples=None):
+    def generate_whole_class_test_with_feedback(self, target_class_name, target_package_name, class_code, public_methods, custom_imports, imports_context, feedback_msg, formatted_examples=None, previous_test_class_code=None):
         method_list_str = '\n'.join(f'- {m}' for m in public_methods)
         imports_section = '\n'.join(custom_imports) if custom_imports else ''
         strictness = (
@@ -497,15 +503,23 @@ Instructions:
             "If a method or field is not present in the provided code, do NOT use it in your test. "
             "If you are unsure, leave it out. "
             "If you hallucinate any code, you will be penalized and re-prompted. "
-            "You must generate a compiling, passing, and style-compliant test class."
+            "You must generate a compiling, passing, and style-compliant test class. "
+            "If the class or its methods use a logger (e.g., org.slf4j.Logger, log.info, log.error, etc.), write tests that verify logging behavior where appropriate. "
+            "Use Mockito or other suitable techniques to verify that logging statements are called as expected, especially for error or important info logs. "
+            "If you are unsure how to verify logging, add a comment in the test indicating what should be checked. "
+            "Generate tests for exception/negative paths (e.g., when repo throws). "
+            "Cover edge cases and all branches (e.g., with/without working location). "
+            "Do NOT define or create dummy DTOs, entities, or repository interfaces inside the test class. Use only the real classes provided in the context. If a class is missing, do NOT invent it—report an error instead."
         )
         prompt = ''
+        if feedback_msg:
+            prompt += f"{feedback_msg}\n\n"
+        if previous_test_class_code:
+            prompt += f"PREVIOUS TEST CASE OUTPUT:\n--- BEGIN PREVIOUS OUTPUT ---\n{previous_test_class_code}\n--- END PREVIOUS OUTPUT ---\n\n"
         if formatted_examples:
             prompt += f"// The following are real test examples from your codebase.\n{formatted_examples}\n\n"
         prompt += f"""
-{feedback_msg}
-
-You are an expert Java developer. You are to generate a complete JUnit 5 + Mockito test class for the MAIN CLASS below. The other classes are provided as context only (do NOT generate tests for them).
+You are an expert Java developer. You are to fix and regenerate a complete JUnit 5 + Mockito test class for the MAIN CLASS below. The other classes are provided as context only (do NOT generate tests for them).
 
 {imports_context}
 
@@ -525,11 +539,9 @@ Instructions:
 
 {strictness}
 """
-        print("\n--- WHOLE-CLASS TEST GENERATION PROMPT (WITH FEEDBACK, FULL) ---\n" + prompt + "\n--- END WHOLE-CLASS TEST GENERATION PROMPT ---\n")
         result = self.llm.invoke(prompt)
         if hasattr(result, "content"):
             result = result.content
-        print("\n--- RAW LLM WHOLE-CLASS OUTPUT (WITH FEEDBACK, FULL) ---\n" + result + "\n--- END RAW LLM WHOLE-CLASS OUTPUT ---\n")
         return result.strip()
 
     def generate_test_case(self, 
@@ -542,294 +554,102 @@ Instructions:
                            requires_db_test: bool,
                            dependency_signatures: Dict[str, str] = None,
                            target_info: Dict[str, Any] = None) -> str:
-        self._update_retriever_filter(relevant_java_files_for_context, k_override=10)
+        # --- Early exit if test file already exists ---
+        if test_output_file_path.exists():
+            print(f"[SKIP] Test file already exists (inside generate_test_case): '{test_output_file_path}'")
+            print(f"Skipping test generation for {target_class_name} (generate_test_case)")
+            return ""
+
+        # Retrieve the full class code for the main class under test
+        main_class_filename = Path(target_info['java_file_path_abs']).name if target_info else None
+        dependency_filenames = [Path(f).name for f in relevant_java_files_for_context if Path(f).name != main_class_filename]
+        utility_filenames = [Path(f).name for f in relevant_java_files_for_context if Path(f).name not in dependency_filenames and Path(f).name != main_class_filename]
+        self._update_retriever_filter(main_class_filename, dependency_filenames, utility_filenames, k_override=5)
         retrieved_docs = self.retriever.get_relevant_documents(f"Full code for {target_class_name}")
         class_code = "\n\n".join([doc.page_content for doc in retrieved_docs if target_class_name in doc.page_content])
         if not class_code:
             class_code = "\n\n".join([doc.page_content for doc in retrieved_docs])
-        public_methods = sorted(self.extract_public_methods(class_code))
-        
-        # --- Set retry limits ---
-        MAX_RETRIES = 15
-        max_feedback_retries = MAX_RETRIES
-        max_retries = MAX_RETRIES
-
-        print(f"[DEBUG] Starting test generation for: {target_class_name}")
-        print(f"[DEBUG] Output test file will be: {test_output_file_path}")
-        print(f"[DEBUG] Custom imports: {custom_imports}")
-        print(f"[DEBUG] Additional instructions: {additional_query_instructions}")
-        print(f"[DEBUG] Target info: {target_info}")
-
-        # --- Retrieve the full class code for the main class under test ---
-        print(f"[DEBUG] Fetching main class code for: {target_class_name}")
-        class_code = None
-        main_java_filename = None
-        if target_info and 'java_file_path_abs' in target_info:
-            main_java_filename = Path(target_info['java_file_path_abs']).name
-        if main_java_filename:
-            print(f"[DEBUG] Using ChromaDB retriever for file: {main_java_filename}")
-            self._update_retriever_filter([main_java_filename], k_override=20)
-            retrieved_docs = self.retriever.get_relevant_documents(f"Full code for {target_class_name}")
-            print(f"[DEBUG] Retrieved {len(retrieved_docs)} docs from ChromaDB for main class.")
-            for i, doc in enumerate(retrieved_docs):
-                print(f"[DEBUG] Main class chunk {i+1}:\n{doc.page_content[:500]}{'...' if len(doc.page_content) > 500 else ''}\n---")
-            class_code = "\n\n".join([doc.page_content for doc in retrieved_docs if target_class_name in doc.page_content])
-            if not class_code:
-                class_code = "\n\n".join([doc.page_content for doc in retrieved_docs])
-            print(f"[DEBUG] Loaded class code for {target_class_name} from ChromaDB chunks.")
-        else:
-            class_code = ""
+        if not class_code:
+            class_code = "// ERROR: Could not retrieve main class code from ChromaDB."
         print("\n[DEBUG] CLASS CODE SENT TO LLM (FULL):\n" + class_code + "\n[END DEBUG CLASS CODE]\n")
 
-        # --- Extract project-local imports and load their code as context from ChromaDB ---
-        print(f"[DEBUG] Extracting and fetching imported class context for: {target_class_name}")
-        import_pattern = re.compile(r'^import\s+(com\\.iemr\\.[\\w\\.]+)\\.([A-Z][A-Za-z0-9_]*)\;', re.MULTILINE)
-        imported_classes = []
-        for match in import_pattern.finditer(class_code):
-            class_name = match.group(2)
-            dep_java_filename = f"{class_name}.java"
-            print(f"[DEBUG] Fetching import: {dep_java_filename}")
-            self._update_retriever_filter([dep_java_filename], k_override=10)
-            dep_docs = self.retriever.get_relevant_documents(f"Full code for {class_name}")
-            print(f"[DEBUG] Retrieved {len(dep_docs)} docs from ChromaDB for import {class_name}.")
-            for i, doc in enumerate(dep_docs):
-                print(f"[DEBUG] Import chunk {i+1} for {class_name}:\n{doc.page_content[:500]}{'...' if len(doc.page_content) > 500 else ''}\n---")
-            dep_code = "\n\n".join([doc.page_content for doc in dep_docs if class_name in doc.page_content])
-            if not dep_code:
-                dep_code = "\n\n".join([doc.page_content for doc in dep_docs])
-            if dep_code:
-                imported_classes.append((class_name, dep_code))
-                print(f"[DEBUG] Added imported class context for {class_name} from ChromaDB.")
-            else:
-                print(f"[WARNING] Imported class code not found in ChromaDB: {dep_java_filename}")
-        imports_context = ""
-        for class_name, dep_code in imported_classes:
-            print(f"[DEBUG] IMPORTED CLASS CONTEXT for {class_name}:\n{dep_code}\n--- END IMPORTED CLASS ---")
-            imports_context += f"\n--- BEGIN IMPORTED CLASS: {class_name} ---\n{dep_code}\n--- END IMPORTED CLASS: {class_name} ---\n"
+        public_methods = self.extract_public_methods(class_code)
+        test_type = self._detect_test_type(target_info) if target_info else None
+        if test_type is None:
+            test_type = 'service'  # fallback
 
-        # --- Ensure imported_class_members is defined before feedback loop ---
-        def extract_class_members(java_code):
-            method_pattern = re.compile(r'(public|protected|private)?\s+[\w<>,\[\]]+\s+(\w+)\s*\([^)]*\)')
-            field_pattern = re.compile(r'(private|protected|public)\s+[\w<>,\[\]]+\s+(\w+)\s*[;=]')
-            members = set()
-            fields = []
-            for f in field_pattern.finditer(java_code):
-                field_name = f.group(2)
-                fields.append(field_name)
-                members.add(field_name)
-            for m in method_pattern.finditer(java_code):
-                members.add(m.group(2))
-            if ('@Data' in java_code) or ('@Getter' in java_code) or ('@Setter' in java_code):
-                for field in fields:
-                    if not field:
-                        continue
-                    cap = field[0].upper() + field[1:] if len(field) > 1 else field.upper()
-                    members.add(f'get{cap}')
-                    members.add(f'set{cap}')
-            return members
-        imported_class_members = {}
-        for class_name, dep_code in imported_classes:
-            imported_class_members[class_name] = extract_class_members(dep_code)
-
-        # --- RAG: Retrieve real test examples ---
-        print(f"[RAG] Retrieving real test examples for: {target_class_name}")
-        method_sigs = list(self.extract_public_methods(class_code))
-        test_examples = self.retrieve_similar_test_examples(class_code, method_sigs, top_n=3)
-        formatted_examples = self.format_test_examples_for_prompt(test_examples) if test_examples else ''
-        if formatted_examples:
-            print(f"[RAG] Retrieved {len(test_examples)} real test examples. Including in prompt.")
+        # Select the correct prompt template
+        if test_type == 'controller':
+            prompt_template = get_controller_test_prompt_template(
+                target_class_name, target_package_name, custom_imports, additional_query_instructions
+            )
         else:
-            print(f"[RAG] No real test examples found for this class.")
+            prompt_template = get_service_test_prompt_template(
+                target_class_name, target_package_name, custom_imports, additional_query_instructions
+            )
 
-        # --- Automated feedback loop for hallucinated members ---
-        feedback_attempt = 0
-        hallucinated = set()
-        while feedback_attempt <= max_feedback_retries:
-            print(f"[DEBUG] Hallucination feedback loop attempt {feedback_attempt+1}")
-            if feedback_attempt == 0:
-                test_class_code = self.generate_whole_class_test_with_context(target_class_name, target_package_name, class_code, public_methods, custom_imports, imports_context, formatted_examples)
-            else:
-                test_class_code = self.generate_whole_class_test_with_feedback(target_class_name, target_package_name, class_code, public_methods, custom_imports, imports_context, feedback_msg, formatted_examples)
-            print(f"[DEBUG] LLM OUTPUT (hallucination check):\n{test_class_code}\n--- END LLM OUTPUT ---")
-            hallucinated = self.find_hallucinated_members(test_class_code, imported_class_members)
-            print(f"[DEBUG] Hallucinated members found: {hallucinated}")
-            if not hallucinated:
+        # Feedback-driven generation loop
+        max_retries = MAX_TEST_GENERATION_RETRIES
+        error_feedback = None
+        last_valid_code = None
+        for attempt in range(max_retries):
+            prompt = prompt_template
+            if error_feedback and attempt > 0:
+                prompt += f"\n--- ERROR FEEDBACK FROM PREVIOUS ATTEMPT ---\n{error_feedback}\n--- END ERROR FEEDBACK ---\n"
+            result = self.llm.invoke(prompt.replace('{context}', class_code))
+            if hasattr(result, "content"):
+                result = result.content
+            code = result.strip()
+            code = re.sub(r'^```[a-zA-Z]*\n', '', code)
+            code = re.sub(r'^```', '', code)
+            code = re.sub(r'```$', '', code)
+            code = code.strip()
+            # Write to file
+            test_output_file_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(test_output_file_path, 'w', encoding='utf-8') as f:
+                f.write(code)
+            # Run the test file
+            test_run_results = self.java_test_runner.run_test(test_output_file_path)
+            compilation_errors = test_run_results['detailed_errors'].get('compilation_errors', [])
+            test_failures = test_run_results['detailed_errors'].get('test_failures', [])
+            tests_run_zero = False
+            stdout = test_run_results.get('stdout', '')
+            test_summary_match = re.search(r"Tests run: (\d+), Failures: (\d+), Errors: (\d+), Skipped: (\d+)", stdout)
+            if test_summary_match:
+                total = int(test_summary_match.group(1))
+                if total == 0:
+                    tests_run_zero = True
+                    print("[WARNING] No tests were run (Tests run: 0). Treating as failure.")
+            if not compilation_errors and not test_failures and not tests_run_zero:
+                print(f"[SUCCESS] No compilation or test errors after {attempt+1} attempt(s).")
+                last_valid_code = code
                 break
-            print(f"[FEEDBACK LOOP] Hallucinated members found: {hallucinated}. Re-prompting LLM with feedback.")
-            feedback_msg = ("WARNING: In your previous output, you used the following members which do NOT exist in the provided code: "
-                            f"{', '.join(hallucinated)}. Do NOT use these or any other non-existent members. Only use what is present in the code blocks below. If you hallucinate again, you will be penalized.")
-            feedback_attempt += 1
-        test_class_code = test_class_code.strip()
-        test_class_code = re.sub(r'^```[a-zA-Z]*\n', '', test_class_code)
-        test_class_code = re.sub(r'^```', '', test_class_code)
-        test_class_code = re.sub(r'```$', '', test_class_code)
-        test_class_code = test_class_code.strip()
-        all_test_class_outputs = [test_class_code]
-
-        if not public_methods:
-            print(f"[WARNING] No public methods found in {target_class_name}. Skipping test generation.")
-            return ""
-
-        print(f"[DEBUG] Validating test plan for {target_class_name}")
-        test_plan = self.generate_test_plan(target_class_name, class_code)
-        print(f"[DEBUG] LLM-generated test plan: {test_plan}")
-        plan_methods = [tc['method_name'] for tc in test_plan]
-        real_methods = sorted(public_methods)
-        print(f"[DEBUG] Methods from static analysis: {real_methods}")
-        retries = 0
-        while set(plan_methods) != set(real_methods) and retries < MAX_RETRIES:
-            print(f"[TEST PLAN VALIDATION] Mismatch between LLM plan and real methods. Retrying with strict feedback.")
-            print(f"  LLM plan methods: {plan_methods}")
-            print(f"  Static analysis methods: {real_methods}")
-            test_plan = self.generate_test_plan(target_class_name, class_code, real_methods)
-            print(f"[DEBUG] LLM-generated test plan (retry {retries+1}): {test_plan}")
-            plan_methods = [tc['method_name'] for tc in test_plan]
-            retries += 1
-        if set(plan_methods) != set(real_methods):
-            print(f"[TEST PLAN VALIDATION] LLM failed to match real method list after retries. Using static analysis list.")
-            print(f"  LLM plan methods: {plan_methods}")
-            print(f"  Static analysis methods: {real_methods}")
-            plan_methods = real_methods
-            test_plan = [{"method_name": m, "description": f"Test for {m}"} for m in real_methods]
-        max_methods_per_group = 5
-        method_groups = [plan_methods[i:i+max_methods_per_group] for i in range(0, len(plan_methods), max_methods_per_group)]
-        for group in method_groups:
-            print(f"[DEBUG] Generating test group for methods: {group}")
-            group_methods = [tc for tc in test_plan if tc['method_name'] in group]
-            anti_hallucination = "Do NOT invent methods, do NOT mock POJOs/value objects, only mock what is required for compilation or isolation. BAD: Mocks unused dependencies. GOOD: Only mocks required dependencies. If unsure, prefer not to mock. INCLUDE ALL PUBLIC METHODS, INCLUDING STATIC METHODS."
-            positive_example = "// GOOD: Only mocks required dependencies, covers all public and static methods."
-            negative_example = "// BAD: Mocks unused dependencies, skips methods, causes build to fail."
-            prompt_instructions = f"{additional_query_instructions}\n{anti_hallucination}\n{positive_example}\n{negative_example}"
-            group_test_code = self.generate_whole_class_test_with_context(target_class_name, target_package_name, class_code, group, custom_imports, imports_context, formatted_examples)
-            print(f"[DEBUG] RAW LLM OUTPUT for group {group}:\n{group_test_code}\n--- END RAW LLM OUTPUT ---")
-            group_test_code = group_test_code.strip()
-            group_test_code = re.sub(r'^```[a-zA-Z]*\n', '', group_test_code)
-            group_test_code = re.sub(r'^```', '', group_test_code)
-            group_test_code = re.sub(r'```$', '', group_test_code)
-            group_test_code = group_test_code.strip()
-            error_feedback = None
-            last_valid_code = None
-            for attempt in range(MAX_RETRIES):
-                print(f"[DEBUG] Test generation retry {attempt+1} for group: {group}")
-                if error_feedback and attempt > 0:
-                    print(f"[LLM ERROR FEEDBACK] Feeding the following error message to LLM (attempt {attempt+1}):\n{error_feedback}\n--- END ERROR FEEDBACK ---")
-                    group_test_code = self.generate_whole_class_test_with_feedback(target_class_name, target_package_name, class_code, group, custom_imports, imports_context, error_feedback, formatted_examples)
-                    print(f"[DEBUG] RAW LLM OUTPUT (after feedback) for group {group}:\n{group_test_code}\n--- END RAW LLM OUTPUT ---")
-                    group_test_code = group_test_code.strip()
-                    group_test_code = re.sub(r'^```[a-zA-Z]*\n', '', group_test_code)
-                    group_test_code = re.sub(r'^```', '', group_test_code)
-                    group_test_code = re.sub(r'```$', '', group_test_code)
-                    group_test_code = group_test_code.strip()
-                test_output_file_path.parent.mkdir(parents=True, exist_ok=True)
-                with open(test_output_file_path, 'w', encoding='utf-8') as f:
-                    f.write(group_test_code)
-                test_run_results = self.java_test_runner.run_test(test_output_file_path)
-                print(f"[DEBUG] Test run results: {test_run_results}")
-                compilation_errors = test_run_results['detailed_errors'].get('compilation_errors', [])
-                test_failures = test_run_results['detailed_errors'].get('test_failures', [])
-                print(f"[DEBUG] Compilation errors: {compilation_errors}")
-                print(f"[DEBUG] Test failures: {test_failures}")
-                if not compilation_errors and not test_failures:
-                    print(f"[SUCCESS] No compilation or test errors after {attempt+1} attempt(s).")
-                    last_valid_code = group_test_code
-                    break
-                else:
-                    error_msgs = []
-                    if compilation_errors:
-                        print(f"[COMPILATION ERROR] Detected after attempt {attempt+1}:")
-                        for err in compilation_errors:
-                            print(f"  - {err['message']} (at {err['location']})")
-                            error_msgs.append(f"COMPILATION: {err['message']} (at {err['location']})")
-                    if test_failures:
-                        print(f"[TEST FAILURE] Detected after attempt {attempt+1}:")
-                        for err in test_failures:
-                            print(f"  - {err['message']} (in {err['location']})")
-                            error_msgs.append(f"TEST: {err['message']} (in {err['location']})")
-                    error_feedback = '\n'.join(error_msgs)
-            if last_valid_code:
-                all_test_class_outputs.append(last_valid_code)
             else:
-                print(f"[ERROR] Test generation failed for methods {group} after {MAX_RETRIES} attempts. See logs for details.")
-        all_methods = []
-        covered_methods = set()
-        for code in all_test_class_outputs:
-            extracted_methods = self.extract_all_test_methods(code)
-            print(f"[DEBUG] Extracted test methods: {extracted_methods}")
-            if extracted_methods:
-                all_methods.extend(extracted_methods)
-                for m in extracted_methods:
-                    match = re.search(r'void\s+(test_?([A-Za-z0-9_]+))\s*\(', m)
-                    if match:
-                        covered_methods.add(match.group(2).lower())
-            else:
-                if 'class' in code and 'Test' in code and ('@Test' in code or 'void' in code):
-                    print(f"[FALLBACK] Using LLM output directly as test class for {target_class_name}")
-                    cleaned_code = code.strip()
-                    cleaned_code = re.sub(r'^```[a-zA-Z]*\n', '', cleaned_code)
-                    cleaned_code = re.sub(r'^```', '', cleaned_code)
-                    cleaned_code = re.sub(r'```$', '', cleaned_code)
-                    cleaned_code = cleaned_code.strip()
-                    print(f"[DEBUG] FINAL TEST CLASS CODE (FALLBACK):\n{cleaned_code}\n--- END FINAL TEST CLASS CODE ---")
-                    return cleaned_code
-        for real_method in real_methods:
-            if not any(real_method.lower() in m.lower() for m in covered_methods):
-                print(f"[LLM COVERAGE] Prompting LLM to generate test for uncovered method: {real_method}")
-                single_method_prompt = f"""
-You are an expert Java test writer. Write a JUnit 5 + Mockito test method for the following public method in the class {target_class_name}:
-
-Method signature:
-{real_method}
-
-Class code:
-{class_code}
-
-STRICT REQUIREMENTS:
-- Output ONLY the Java test method code, no class definition, no imports, no explanations, no markdown.
-- Use Mockito for mocking dependencies.
-- Use JUnit5 assertions.
-- Do NOT repeat the class under test.
-- The test method name should clearly reference the method being tested.
-- Use the following imports if needed (but do NOT output import statements):
-{chr(10).join(custom_imports)}
-- Do NOT invent or use any methods, fields, or classes not present in the provided code. If you hallucinate, you will be penalized.
-"""
-                for attempt in range(MAX_RETRIES):
-                    print(f"[LLM COVERAGE] Retry {attempt+1} for method: {real_method}")
-                    print(f"[LLM COVERAGE] Prompt sent to LLM:\n{single_method_prompt}\n--- END PROMPT ---")
-                    result = self.llm.invoke(single_method_prompt)
-                    if hasattr(result, "content"):
-                        result = result.content
-                    print(f"[LLM COVERAGE] RAW LLM OUTPUT for method {real_method}:\n{result}\n--- END RAW LLM OUTPUT ---")
-                    code = result.strip()
-                    methods = self.extract_all_test_methods(code)
-                    print(f"[LLM COVERAGE] Extracted methods: {methods}")
-                    if methods:
-                        all_methods.extend(methods)
-                        covered_methods.add(real_method.lower())
-                        break
-        if not all_methods:
-            print(f"[ERROR] No test methods extracted for {target_class_name}. Skipping test class.")
-            return ""
-        final_test_class_code = self.assemble_test_class(target_package_name, custom_imports, target_class_name, all_methods, class_code)
-        final_test_class_code = final_test_class_code.strip()
-        final_test_class_code = re.sub(r'^```[a-zA-Z]*\n', '', final_test_class_code)
-        final_test_class_code = re.sub(r'^```', '', final_test_class_code)
-        final_test_class_code = re.sub(r'```$', '', final_test_class_code)
-        final_test_class_code = final_test_class_code.strip()
-        print(f"[DEBUG] FINAL GENERATED TEST CLASS CODE (before write):\n{final_test_class_code}\n--- END FINAL TEST CLASS CODE ---")
-        test_output_file_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(test_output_file_path, 'w', encoding='utf-8') as f:
-            f.write(final_test_class_code)
-        print(f"[FINAL SUCCESS] Generated test case saved to: '{test_output_file_path}'")
-        print("\n--- FINAL GENERATED TEST CASE (Printed to Console for review) ---")
-        print(final_test_class_code)
-        print("\n" + "="*80 + "\n")
-        return final_test_class_code
+                error_msgs = []
+                if compilation_errors:
+                    print(f"[COMPILATION ERROR] Detected after attempt {attempt+1}:")
+                    for err in compilation_errors:
+                        print(f"  - {err['message']} (at {err['location']})")
+                        error_msgs.append(f"COMPILATION: {err['message']} (at {err['location']})")
+                if test_failures:
+                    print(f"[TEST FAILURE] Detected after attempt {attempt+1}:")
+                    for err in test_failures:
+                        print(f"  - {err['message']} (in {err['location']})")
+                        error_msgs.append(f"TEST: {err['message']} (in {err['location']})")
+                if tests_run_zero:
+                    error_msgs.append("NO TESTS RUN: The generated test class did not contain any executable tests. Ensure at least one @Test method is present and not ignored/skipped.")
+                error_feedback = '\n'.join(error_msgs)
+        if last_valid_code:
+            print(f"[FINAL SUCCESS] Generated test case saved to: '{test_output_file_path}'")
+            return last_valid_code
+        else:
+            print(f"[ERROR] Test generation failed for {target_class_name} after {max_retries} attempts. See logs for details.")
+            return "// Test not generated: failed after feedback loop."
 
     def extract_public_methods(self, class_code: str) -> set:
         """
         Extracts all public method names from the given Java class code using regex.
-        Includes constructors and static methods.
+        Includes constructors and static methods. Handles annotations, generics, and line breaks.
         """
         methods = set()
         
@@ -838,16 +658,23 @@ STRICT REQUIREMENTS:
         for match in constructor_pattern.finditer(class_code):
             methods.add(match.group(1))
         
-        # Match public methods (including static, final, etc.)
-        method_pattern = re.compile(r'public\s+(?:static\s+)?(?:final\s+)?(?:abstract\s+)?(?:synchronized\s+)?(?:native\s+)?(?:strictfp\s+)?(?:<[^>]+>\s+)?[\w<>\[\]]+\s+(\w+)\s*\(')
+        # Improved pattern for Spring controller methods (handles @ResponseBody and other annotations)
+        method_pattern = re.compile(
+            r'public\s+'  # public modifier
+            r'(?:@[\w.]+\s*)*'  # Annotations after public (like @ResponseBody)
+            r'(?:[\w<>\[\],\s]+\s+)*'  # Return type
+            r'(\w+)\s*\(',  # Method name
+            re.MULTILINE
+        )
         for match in method_pattern.finditer(class_code):
             methods.add(match.group(1))
         
         # Match public static methods that might have different patterns
-        static_method_pattern = re.compile(r'public\s+static\s+(?:final\s+)?(?:<[^>]+>\s+)?[\w<>\[\]]+\s+(\w+)\s*\(')
+        static_method_pattern = re.compile(r'public\s+static\s+(?:final\s+)?(?:<[^>]+>\s+)?[\w<>,\[\]]+\s+(\w+)\s*\(')
         for match in static_method_pattern.finditer(class_code):
             methods.add(match.group(1))
         
+        print(f"[DEBUG] extract_public_methods found: {methods}")
         return methods
 
     def extract_test_plan_methods(self, test_plan: list) -> set:
@@ -856,71 +683,72 @@ STRICT REQUIREMENTS:
         """
         return set(tc['method_name'] for tc in test_plan if 'method_name' in tc)
 
-    def assemble_test_class(self, package_name: str, imports: List[str], class_name: str, test_methods: List[str], class_code: str = "") -> str:
+    def assemble_test_class(self, package_name: str, imports: List[str], class_name: str, test_methods: List[str], class_code: str = "", test_type: str = "service") -> str:
         """
         Assemble the final test class file with package, imports, annotations, class definition, and all test methods.
-        Auto-detects and adds missing imports for all classes used in the test methods.
+        - For 'controller', use @WebMvcTest, @MockBean, @Autowired MockMvc, and organize with @Nested classes if possible.
+        - For 'service'/'repository', use @ExtendWith(MockitoExtension.class), @Mock, @InjectMocks.
+        - Only add relevant imports/annotations for the test type.
+        - Post-process to check for mixed usage (e.g., both @MockBean and @InjectMocks) and reject/fix if found.
+        - All generated test methods are grouped by collecting them into a list, deduplicating by method name, and joining them in the class body.
         """
         # Auto-detect used class names and add missing imports
         used_class_names = self._extract_used_class_names(test_methods)
         auto_imports = self._map_class_names_to_imports(used_class_names, class_code, extra_known_imports=imports)
-        
-        # Compose package statement
+
         package_stmt = f"package {package_name};\n" if package_name else ""
-        
-        # Clean and prepare imports
         all_imports = []
-        
-        # Process custom imports (remove 'import ' prefix if present)
         for imp in imports:
             if imp.startswith('import '):
                 all_imports.append(imp)
             else:
                 all_imports.append(f"import {imp};")
-        
-        # Process auto-detected imports
         for imp in auto_imports:
             if imp.startswith('import '):
                 all_imports.append(imp)
             else:
                 all_imports.append(f"import {imp};")
-        
-        # Add standard test imports
-        standard_imports = [
-            "import org.junit.jupiter.api.Test;",
-            "import org.junit.jupiter.api.extension.ExtendWith;",
-            "import org.mockito.InjectMocks;",
-            "import org.mockito.Mock;",
-            "import org.mockito.junit.jupiter.MockitoExtension;",
-            "import static org.mockito.Mockito.*;",
-            "import static org.junit.jupiter.api.Assertions.*;"
-        ]
-        all_imports.extend(standard_imports)
-        
-        # Remove duplicates and sort
         unique_imports = sorted(set(all_imports))
-        
-        # Separate static and non-static imports
         static_imports = [imp for imp in unique_imports if "static" in imp]
         regular_imports = [imp for imp in unique_imports if "static" not in imp]
-        
-        # Compose import sections
         import_section = "\n".join(regular_imports)
         static_import_section = "\n".join(static_imports)
-        
-        # Compose class annotation and definition
-        class_anno = "@ExtendWith(MockitoExtension.class)"
-        class_def = f"class {class_name}Test {{"
-        
-        # Join all test methods
+
+        # Controller vs Service/Repository logic
+        if test_type == "controller":
+            class_anno = f"@WebMvcTest({class_name}.class)"
+            class_def = f"class {class_name}Test {{"
+            # Add MockMvc and @MockBean fields if not present in methods
+            field_section = "    @Autowired\n    private MockMvc mockMvc;\n"
+            # Optionally, parse dependencies to add @MockBean fields
+            # (This could be improved by using controller analysis output)
+            # Group methods by @Nested if possible (not enforced here)
+        else:
+            class_anno = "@ExtendWith(MockitoExtension.class)"
+            class_def = f"class {class_name}Test {{"
+            field_section = ""
+
+        # Group and deduplicate test methods
         methods_section = "\n\n".join(m for m in test_methods if m.strip())
-        
+
+        # Post-processing: Check for mixed usage
+        if test_type == "controller":
+            if "@InjectMocks" in methods_section or "@Mock " in methods_section:
+                # Remove or comment out these lines
+                methods_section = methods_section.replace("@InjectMocks", "// [REMOVED: @InjectMocks not allowed in controller tests]")
+                methods_section = methods_section.replace("@Mock ", "// [REMOVED: @Mock not allowed in controller tests]")
+        else:
+            if "@WebMvcTest" in methods_section or "MockMvc" in methods_section or "@MockBean" in methods_section:
+                # Remove or comment out these lines
+                methods_section = methods_section.replace("@WebMvcTest", "// [REMOVED: @WebMvcTest not allowed in service/repo tests]")
+                methods_section = methods_section.replace("MockMvc", "// [REMOVED: MockMvc not allowed in service/repo tests]")
+                methods_section = methods_section.replace("@MockBean", "// [REMOVED: @MockBean not allowed in service/repo tests]")
+
         # Final assembly
         result = f"{package_stmt}\n{import_section}\n"
         if static_import_section:
             result += f"{static_import_section}\n"
-        result += f"\n{class_anno}\n{class_def}\n\n{methods_section}\n\n}}"
-        
+        result += f"\n{class_anno}\n{class_def}\n\n{field_section}{methods_section}\n\n}}"
         return result
 
     def _extract_used_class_names(self, test_methods: List[str]) -> set:
@@ -1035,17 +863,142 @@ STRICT REQUIREMENTS:
     def find_hallucinated_members(self, test_code, imported_class_members):
         hallucinated = set()
         for class_name, members in imported_class_members.items():
-            usage_pattern = re.compile(rf'{class_name}\.([A-Za-z0-9_]+)')
+            # Only check for method/field usage, not class references
+            usage_pattern = re.compile(rf'{re.escape(class_name)}\.([A-Za-z0-9_]+)')
             for match in usage_pattern.finditer(test_code):
                 member = match.group(1)
                 if member not in members:
+                    # Skip common class references that are likely valid
+                    if member.lower() in ['class', 'type', 'getclass']:
+                        continue
                     hallucinated.add(f'{class_name}.{member}')
-            new_pattern = re.compile(rf'new\s+{class_name}\(\)\.([A-Za-z0-9_]+)')
+            
+            # Check for new instance creation followed by method calls
+            new_pattern = re.compile(rf'new\s+{re.escape(class_name)}\(\)\.([A-Za-z0-9_]+)')
             for match in new_pattern.finditer(test_code):
                 member = match.group(1)
                 if member not in members:
+                    # Skip common class references that are likely valid
+                    if member.lower() in ['class', 'type', 'getclass']:
+                        continue
                     hallucinated.add(f'{class_name}.{member}')
         return hallucinated
+
+    def generate_simple_test_case(self, target_class_name: str, target_package_name: str, class_code: str, custom_imports: List[str]) -> str:
+        """
+        Simplified test generation that avoids the complex multi-step process.
+        Generates tests in a single pass with focused prompts.
+        """
+        # Extract public methods using static analysis
+        public_methods = self.extract_public_methods(class_code)
+        if not public_methods:
+            return "// No public methods found to test"
+        
+        method_list = "\n".join(f"- {method}" for method in sorted(public_methods))
+        
+        # Simplified, focused prompt
+        prompt = f"""
+You are an expert Java test developer. Generate a complete JUnit 5 + Mockito test class for the following Java class.
+
+CLASS UNDER TEST:
+{class_code}
+
+REQUIREMENTS:
+- Test class name: {target_class_name}Test
+- Package: {target_package_name}
+- Test ALL these public methods: {method_list}
+- Use @ExtendWith(MockitoExtension.class)
+- Mock only dependencies that are actually used in each test method
+- Include proper imports
+- Test both success and failure scenarios
+- Verify logging behavior if present (use ArgumentCaptor for log messages)
+- Test edge cases and exception handling
+- Use descriptive test method names (e.g., testMethodName_WhenCondition_ShouldReturnExpected)
+- Follow AAA pattern (Arrange, Act, Assert)
+- Use meaningful assertions with clear error messages
+
+IMPORTS TO USE:
+{chr(10).join(custom_imports)}
+
+IMPORTANT:
+- Do NOT invent methods, fields, or classes not present in the source code
+- Do NOT mock simple POJOs or value objects
+- Only mock dependencies that are actually injected or used
+- If unsure about a dependency, prefer not to mock it
+- Ensure all tests compile and run without errors
+
+Output ONLY the complete test class code, no explanations or markdown.
+"""
+        
+        result = self.llm.invoke(prompt)
+        if hasattr(result, "content"):
+            result = result.content
+        
+        # Clean up the output
+        code = result.strip()
+        code = re.sub(r'^```[a-zA-Z]*\n', '', code)
+        code = re.sub(r'^```', '', code)
+        code = re.sub(r'```$', '', code)
+        
+        return code.strip()
+
+    def debug_minimal_controller_prompt(self, target_class_name, target_package_name, method_code, custom_imports):
+        """
+        Debug utility: Send a minimal, focused MockMvc controller prompt to the LLM for a single method.
+        Prints the prompt and the LLM's output.
+        """
+        from llm import test_prompt_templates
+        good_example = '''
+// GOOD EXAMPLE (DO THIS):
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
+import org.springframework.boot.test.mock.mockito.MockBean;
+import org.springframework.test.web.servlet.MockMvc;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
+
+@WebMvcTest(UserController.class)
+class UserControllerTest {
+    @Autowired MockMvc mockMvc;
+    @MockBean UserService userService;
+    @Test void shouldReturnUser_whenUserExists() throws Exception {
+        when(userService.findByName("alice")).thenReturn(new User("alice"));
+        mockMvc.perform(get("/users/alice"))
+            .andExpect(status().isOk())
+            .andExpect(jsonPath("$.name").value("alice"));
+    }
+}
+'''
+        strict_instructions = """
+STRICT: You MUST use MockMvc, @WebMvcTest, @MockBean, and @Autowired MockMvc for all tests. Do NOT use @InjectMocks or @Mock for controllers.
+- Output ONLY compilable Java code, no explanations or markdown.
+- Use @WebMvcTest({target_class_name}.class) for the test class annotation.
+- Use @MockBean for all dependencies (not @Mock).
+- Inject MockMvc using @Autowired.
+- For this method, generate a test method that:
+    - Uses MockMvc to perform HTTP requests (e.g., mockMvc.perform(...)).
+    - Asserts HTTP status, response body, and side effects using andExpect and other assertions.
+    - Mocks service/repository dependencies using @MockBean and Mockito (when, doReturn, etc.).
+- Never instantiate dependencies manually—always use dependency injection and mocking.
+- Do NOT hallucinate methods, fields, helpers, or imports—use only what is present in the provided context and imports.
+- Do NOT invent or use any methods, fields, classes, or helpers not present in the provided code.
+- If you are unsure, leave it out or add a comment.
+- If you hallucinate, you will be penalized and re-prompted.
+- Always include {custom_imports} in the import section.
+- The output must be a single, compilable Java test class, similar in style and completeness to the GOOD EXAMPLE above.
+"""
+        prompt = f"{good_example}\n{strict_instructions}\n--- BEGIN METHOD UNDER TEST ---\n{method_code}\n--- END METHOD UNDER TEST ---"
+        print("\n[DEBUG] Minimal MockMvc Controller Prompt:\n" + prompt + "\n--- END PROMPT ---\n")
+        # Use the LLM directly
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        import os
+        GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+        llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.2)
+        result = llm.invoke(prompt)
+        if hasattr(result, "content"):
+            result = result.content
+        print("\n[DEBUG] LLM Output:\n" + result + "\n--- END LLM OUTPUT ---\n")
 
 if __name__ == "__main__":
     try:
@@ -1111,24 +1064,48 @@ if __name__ == "__main__":
             print("="*80)
 
             # --- Generate the test case with feedback loop ---
-            generated_test_code = test_generator.generate_test_case(
-                target_class_name=target_class_name,
-                target_package_name=target_package_name,
-                custom_imports=custom_imports_list,
-                relevant_java_files_for_context=relevant_java_files_for_context,
-                test_output_file_path=test_output_file_path, # Pass the output path
-                additional_query_instructions="and make sure there are no errors, and you don't cause mismatch in return types and stuff.",
-                requires_db_test=requires_db_test, # Pass the flag to the prompt template
-                dependency_signatures=None, # Pass None for now, as dependency_signatures are not provided in the input
-                target_info=target_info # Pass the target_info for test type detection
-            )
+            # Use simplified method for better reliability
+            USE_SIMPLE_METHOD = False  # Set to False to use complex method
             
-            os.makedirs(test_output_dir, exist_ok=True)
-
-            # Write the final generated test case to the file (could be the corrected one)
-            test_output_file_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(test_output_file_path, 'w', encoding='utf-8') as f:
-                f.write(generated_test_code)
+            if USE_SIMPLE_METHOD:
+                # Get class code directly from the main class file
+                with open(java_file_path_abs, 'r', encoding='utf-8') as f:
+                    class_code = f.read()
+                
+                generated_test_code = test_generator.generate_simple_test_case(
+                    target_class_name=target_class_name,
+                    target_package_name=target_package_name,
+                    class_code=class_code,
+                    custom_imports=custom_imports_list
+                )
+                
+                # Write the generated test code to file
+                test_output_file_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(test_output_file_path, 'w', encoding='utf-8') as f:
+                    f.write(generated_test_code)
+                
+                # Validate the generated test
+                print(f"[VALIDATION] Testing generated test file: {test_output_file_path}")
+                test_results = test_generator.java_test_runner.run_test(test_output_file_path)
+                if test_results['status'] == 'SUCCESS':
+                    print(f"[SUCCESS] Generated test compiles and runs successfully!")
+                else:
+                    print(f"[WARNING] Generated test has issues: {test_results['message']}")
+                    print("Consider reviewing the generated test manually.")
+            else:
+                # Use the complex method (original)
+                generated_test_code = test_generator.generate_test_case(
+                    target_class_name=target_class_name,
+                    target_package_name=target_package_name,
+                    custom_imports=custom_imports_list,
+                    relevant_java_files_for_context=relevant_java_files_for_context,
+                    test_output_file_path=test_output_file_path, # Pass the output path
+                    additional_query_instructions="and make sure there are no errors, and you don't cause mismatch in return types and stuff.",
+                    requires_db_test=requires_db_test, # Pass the flag to the prompt template
+                    dependency_signatures=None, # Pass None for now, as dependency_signatures are not provided in the input
+                    target_info=target_info # Pass the target_info for test type detection
+                )
+            
             print(f"\n[FINAL SUCCESS] Generated test case saved to: '{test_output_file_path}'")
 
             print("\n--- FINAL GENERATED TEST CASE (Printed to Console for review) ---")
