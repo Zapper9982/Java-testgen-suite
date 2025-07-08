@@ -5,6 +5,11 @@ import os
 import json 
 from typing import List, Dict, Any, Union
 import re
+from dotenv import load_dotenv
+load_dotenv()
+
+
+
 
 # Assuming the script is located within the project, e.g., 'your_project_root/src/your_module/script.py'
 # TESTGEN_AUTOMATION_ROOT will be 'your_project_root/'
@@ -1447,9 +1452,9 @@ You are an expert Java test developer. ONLY generate tests for these methods (do
                         error_msgs.append(f"TEST: {err['message']} (in {err['location']})")
                 if tests_run_zero:
                     error_msgs.append("NO TESTS RUN: The generated test class did not contain any executable tests. Ensure at least one @Test method is present and not ignored/skipped.")
-                # Extract full compilation error block from stdout
+                # Extract full compilation error block from stdout (improved, like non-batch)
                 full_compilation_error = self.extract_full_compilation_error(stdout)
-                # Re-prompt with error feedback (simple retry, 1 extra attempt)
+                print("\n[DEBUG] FULL COMPILATION ERROR BLOCK EXTRACTED (BATCH):\n" + (full_compilation_error or '[EMPTY]') + "\n[END DEBUG FULL COMPILATION ERROR BLOCK]\n")
                 feedback = '\n'.join(error_msgs)
                 if full_compilation_error:
                     feedback += '\n\n--- FULL COMPILATION ERROR OUTPUT ---\n' + full_compilation_error + '\n--- END FULL COMPILATION ERROR OUTPUT ---\n'
