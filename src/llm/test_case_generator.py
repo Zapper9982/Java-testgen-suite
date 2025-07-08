@@ -604,10 +604,82 @@ Instructions:
             code = re.sub(r'^```', '', code)
             code = re.sub(r'```$', '', code)
             code = code.strip()
+
+            # --- NEW: Post-process LLM output for imports/fields/structure ---
+            # Extract package statement
+            package_stmt = ''
+            package_match = re.search(r'^(package\s+[^;]+;)', code, re.MULTILINE)
+            if package_match:
+                package_stmt = package_match.group(1)
+            else:
+                package_stmt = f'package {target_package_name};'
+            # Extract import statements
+            batch_imports = self._extract_import_statements(code)
+            # For service/repository, ensure required imports
+            if test_type != "controller":
+                required_service_imports = [
+                    'import org.junit.jupiter.api.extension.ExtendWith;',
+                    'import org.mockito.junit.jupiter.MockitoExtension;'
+                ]
+                for imp in required_service_imports:
+                    if imp not in batch_imports:
+                        batch_imports.insert(0, imp)
+            # Extract field declarations
+            batch_fields = self._extract_field_declarations_list(code)
+            # For controllers, ensure @Autowired MockMvc is present
+            if test_type == "controller":
+                has_mockmvc = any('MockMvc' in f for f in batch_fields)
+                if not has_mockmvc:
+                    batch_fields.insert(0, '@Autowired')
+                    batch_fields.insert(1, 'private MockMvc mockMvc;')
+            # Deduplicate imports and fields
+            batch_imports = list(dict.fromkeys(batch_imports))
+            batch_fields = list(dict.fromkeys(batch_fields))
+            # Extract class annotation and header
+            class_anno = "@WebMvcTest({}.class)".format(target_class_name) if test_type == "controller" else "@ExtendWith(MockitoExtension.class)"
+            class_header_match = re.search(r'(class\s+\w+Test\s*\{)', code)
+            if class_header_match:
+                class_header = class_header_match.group(1)
+            else:
+                class_header = f'class {target_class_name}Test {{'
+            # Extract all lines after the class header (methods, etc.)
+            class_body = ''
+            class_header_idx = code.find(class_header)
+            if class_header_idx != -1:
+                class_body = code[class_header_idx + len(class_header):]
+                # Remove closing brace if present
+                if class_body.rstrip().endswith('}'): class_body = class_body.rstrip()[:-1]
+            else:
+                # Fallback: try to find first '{' and take everything after
+                first_brace = code.find('{')
+                if first_brace != -1:
+                    class_body = code[first_brace+1:]
+                    if class_body.rstrip().endswith('}'): class_body = class_body.rstrip()[:-1]
+                else:
+                    class_body = code
+            # Remove field declarations from class_body (they'll be inserted after header)
+            for f in batch_fields:
+                class_body = class_body.replace(f, '')
+            # Remove import/package/class header/annotation lines from class_body
+            class_body = re.sub(r'^package\s+[^;]+;\s*', '', class_body, flags=re.MULTILINE)
+            class_body = re.sub(r'^import\s+[^;]+;\s*', '', class_body, flags=re.MULTILINE)
+            class_body = re.sub(r'^@WebMvcTest\([^)]*\)\s*', '', class_body, flags=re.MULTILINE)
+            class_body = re.sub(r'^@ExtendWith\([^)]*\)\s*', '', class_body, flags=re.MULTILINE)
+            class_body = re.sub(r'^class\s+\w+Test\s*\{\s*', '', class_body, flags=re.MULTILINE)
+            # Re-assemble test class
+            new_code = f"{package_stmt}\n"
+            if batch_imports:
+                new_code += '\n'.join(batch_imports) + '\n\n'
+            new_code += f"{class_anno}\n{class_header}\n\n"
+            if batch_fields:
+                for f in batch_fields:
+                    new_code += '    ' + f + '\n'
+                new_code += '\n'
+            new_code += class_body.strip() + '\n\n}'
             # Write to file
             test_output_file_path.parent.mkdir(parents=True, exist_ok=True)
             with open(test_output_file_path, 'w', encoding='utf-8') as f:
-                f.write(code)
+                f.write(new_code)
             # Run the test file
             test_run_results = self.java_test_runner.run_test(test_output_file_path)
             compilation_errors = test_run_results['detailed_errors'].get('compilation_errors', [])
@@ -622,7 +694,7 @@ Instructions:
                     print("[WARNING] No tests were run (Tests run: 0). Treating as failure.")
             if not compilation_errors and not test_failures and not tests_run_zero:
                 print(f"[SUCCESS] No compilation or test errors after {attempt+1} attempt(s).")
-                last_valid_code = code
+                last_valid_code = new_code
                 break
             else:
                 error_msgs = []
@@ -638,7 +710,12 @@ Instructions:
                         error_msgs.append(f"TEST: {err['message']} (in {err['location']})")
                 if tests_run_zero:
                     error_msgs.append("NO TESTS RUN: The generated test class did not contain any executable tests. Ensure at least one @Test method is present and not ignored/skipped.")
+                # Extract full compilation error block from stdout
+                full_compilation_error = self.extract_full_compilation_error(stdout)
+                print("\n[DEBUG] FULL COMPILATION ERROR BLOCK EXTRACTED:\n" + (full_compilation_error or '[EMPTY]') + "\n[END DEBUG FULL COMPILATION ERROR BLOCK]\n")
                 error_feedback = '\n'.join(error_msgs)
+                if full_compilation_error:
+                    error_feedback += '\n\n--- FULL COMPILATION ERROR OUTPUT ---\n' + full_compilation_error + '\n--- END FULL COMPILATION ERROR OUTPUT ---\n'
         if last_valid_code:
             print(f"[FINAL SUCCESS] Generated test case saved to: '{test_output_file_path}'")
             return last_valid_code
@@ -1000,6 +1077,456 @@ STRICT: You MUST use MockMvc, @WebMvcTest, @MockBean, and @Autowired MockMvc for
             result = result.content
         print("\n[DEBUG] LLM Output:\n" + result + "\n--- END LLM OUTPUT ---\n")
 
+    def _sanitize_llm_test_methods(self, llm_output: str) -> str:
+        """
+        Sanitize LLM output for batch mode: remove imports, package, class headers, and extra braces.
+        Only keep @Test methods and their bodies.
+        """
+        lines = llm_output.splitlines()
+        keep = []
+        inside_method = False
+        brace_count = 0
+        for line in lines:
+            stripped = line.strip()
+            # Skip package/import/class/interface/enum lines and most annotations except @Test
+            if (stripped.startswith('package ') or
+                stripped.startswith('import ') or
+                (stripped.startswith('class ') and 'Test' in stripped) or
+                stripped.startswith('@ExtendWith') or
+                stripped.startswith('@RunWith') or
+                stripped.startswith('@InjectMocks') or
+                stripped.startswith('@Mock') or
+                stripped.startswith('@WebMvcTest') or
+                stripped.startswith('@SpringBootTest') or
+                stripped.startswith('@BeforeEach') or
+                stripped.startswith('@AfterEach') or
+                stripped.startswith('@Autowired') or
+                stripped.startswith('@MockBean')):
+                continue
+            # Only keep @Test annotation and method bodies
+            if stripped.startswith('@Test'):
+                keep.append(line)
+                inside_method = True
+                brace_count = 0
+                continue
+            if inside_method:
+                keep.append(line)
+                brace_count += line.count('{') - line.count('}')
+                # If method is closed, stop
+                if brace_count <= 0 and ('}' in line):
+                    inside_method = False
+        # Fallback: if nothing kept, just return the original (to avoid empty batch)
+        if not keep:
+            # As a fallback, remove imports, package, and class lines, and braces not part of methods
+            filtered = [l for l in lines if not (l.strip().startswith('package ') or l.strip().startswith('import ') or l.strip().startswith('class '))]
+            return '\n'.join(filtered)
+        return '\n'.join(keep)
+
+    def _extract_field_declarations(self, llm_output: str) -> str:
+        """
+        Extract field declarations (with @Mock, @InjectMocks, @MockBean, etc.) from LLM output.
+        Returns a string with the field declarations to be inserted after the class header.
+        """
+        lines = llm_output.splitlines()
+        keep = []
+        inside_field = False
+        for line in lines:
+            stripped = line.strip()
+            # Look for field-level annotations and declarations
+            if (stripped.startswith('@Mock') or
+                stripped.startswith('@InjectMocks') or
+                stripped.startswith('@MockBean') or
+                stripped.startswith('@Autowired')):
+                keep.append(line)
+                inside_field = True
+                continue
+            # If inside a field declaration, keep the next line (the field itself)
+            if inside_field:
+                if (stripped and not stripped.startswith('@')):
+                    keep.append(line)
+                    inside_field = False
+        return '\n'.join(keep)
+
+    def _extract_import_statements(self, llm_output: str) -> list:
+        """
+        Extract import statements from LLM output.
+        Returns a list of unique import statements.
+        """
+        lines = llm_output.splitlines()
+        imports = [line.strip() for line in lines if line.strip().startswith('import ')]
+        return list(dict.fromkeys(imports))  # Deduplicate, preserve order
+
+    def _update_imports_in_test_file(self, test_output_file_path: Path, new_imports: list, package_stmt: str):
+        """
+        Update the import section of the test file by adding any new imports (deduplicated),
+        keeping them after the package statement and before the class annotation/header.
+        """
+        with open(test_output_file_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        # Find package line
+        package_idx = 0
+        for i, line in enumerate(lines):
+            if line.strip().startswith('package '):
+                package_idx = i
+                break
+        # Find where imports end (first non-import, non-empty after package)
+        import_start = package_idx + 1
+        import_end = import_start
+        while import_end < len(lines) and (lines[import_end].strip().startswith('import ') or lines[import_end].strip() == ''):
+            import_end += 1
+        # Collect existing imports
+        existing_imports = set()
+        for i in range(import_start, import_end):
+            if lines[i].strip().startswith('import '):
+                existing_imports.add(lines[i].strip())
+        # Add new imports, deduplicated
+        all_imports = list(existing_imports)
+        for imp in new_imports:
+            if imp not in existing_imports:
+                all_imports.append(imp)
+        # Rebuild file
+        new_lines = []
+        new_lines.extend(lines[:import_start])
+        if all_imports:
+            new_lines.extend([imp + '\n' for imp in all_imports])
+            new_lines.append('\n')
+        new_lines.extend(lines[import_end:])
+        with open(test_output_file_path, 'w', encoding='utf-8') as f:
+            f.writelines(new_lines)
+
+    def _extract_field_declarations_list(self, llm_output: str) -> list:
+        """
+        Extract field declarations (with @Mock, @InjectMocks, @MockBean, etc.) from LLM output as a list of lines.
+        """
+        lines = llm_output.splitlines()
+        keep = []
+        inside_field = False
+        for line in lines:
+            stripped = line.strip()
+            if (stripped.startswith('@Mock') or
+                stripped.startswith('@InjectMocks') or
+                stripped.startswith('@MockBean') or
+                stripped.startswith('@Autowired')):
+                keep.append(line)
+                inside_field = True
+                continue
+            if inside_field:
+                if (stripped and not stripped.startswith('@')):
+                    keep.append(line)
+                    inside_field = False
+        return keep
+
+    def _update_fields_in_test_file(self, test_output_file_path: Path, new_fields: list):
+        """
+        Update the field section of the test file by adding any new field declarations (deduplicated),
+        after the class header and before the first test method.
+        """
+        with open(test_output_file_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        # Find the class header (first line ending with '{')
+        class_header_idx = 0
+        for i, line in enumerate(lines):
+            if line.strip().endswith('{'):
+                class_header_idx = i
+                break
+        # Find where the first @Test method starts (or end of field section)
+        field_end = class_header_idx + 1
+        while field_end < len(lines) and not lines[field_end].strip().startswith('@Test'):
+            field_end += 1
+        # Collect existing fields
+        existing_fields = set()
+        for i in range(class_header_idx + 1, field_end):
+            l = lines[i].strip()
+            if l:
+                existing_fields.add(l)
+        # Add new fields, deduplicated
+        all_fields = list(existing_fields)
+        for f in new_fields:
+            if f.strip() and f.strip() not in existing_fields:
+                all_fields.append(f.strip())
+        # Rebuild file
+        new_lines = []
+        new_lines.extend(lines[:class_header_idx + 1])
+        if all_fields:
+            for f in all_fields:
+                new_lines.append('    ' + f + '\n' if not f.startswith('    ') else f + '\n')
+            new_lines.append('\n')
+        new_lines.extend(lines[field_end:])
+        with open(test_output_file_path, 'w', encoding='utf-8') as f:
+            f.writelines(new_lines)
+
+    def _extract_test_method_names(self, code: str) -> set:
+        """
+        Extract all @Test method names from the given Java code.
+        """
+        method_names = set()
+        # Look for @Test ... void methodName(...)
+        pattern = re.compile(r'@Test\s+(?:public\s+|private\s+|protected\s+)?void\s+(\w+)\s*\(', re.MULTILINE)
+        for match in pattern.finditer(code):
+            method_names.add(match.group(1))
+        # Also handle @Test on previous line
+        pattern2 = re.compile(r'@Test\s*\n\s*(?:public\s+|private\s+|protected\s+)?void\s+(\w+)\s*\(', re.MULTILINE)
+        for match in pattern2.finditer(code):
+            method_names.add(match.group(1))
+        return method_names
+
+    def generate_test_case_in_batches(self,
+                                     target_class_name: str,
+                                     target_package_name: str,
+                                     custom_imports: List[str],
+                                     relevant_java_files_for_context: List[str],
+                                     test_output_file_path: Path,
+                                     additional_query_instructions: str,
+                                     requires_db_test: bool,
+                                     dependency_signatures: Dict[str, str] = None,
+                                     target_info: Dict[str, Any] = None) -> str:
+        """
+        Generate test cases for large classes in batches of 5 methods at a time.
+        For each batch, prompt the LLM to generate only the relevant test methods, append them to the test class file,
+        and after each batch, compile and run the tests. If not the first batch, include the current test class code as context.
+        """
+        # --- Early exit if test file already exists ---
+        if test_output_file_path.exists():
+            print(f"[SKIP] Test file already exists (inside generate_test_case_in_batches): '{test_output_file_path}'")
+            print(f"Skipping test generation for {target_class_name} (generate_test_case_in_batches)")
+            return ""
+
+        # Retrieve the full class code for the main class under test
+        main_class_filename = Path(target_info['java_file_path_abs']).name if target_info else None
+        dependency_filenames = [Path(f).name for f in relevant_java_files_for_context if Path(f).name != main_class_filename]
+        utility_filenames = [Path(f).name for f in relevant_java_files_for_context if Path(f).name not in dependency_filenames and Path(f).name != main_class_filename]
+        self._update_retriever_filter(main_class_filename, dependency_filenames, utility_filenames, k_override=5)
+        retrieved_docs = self.retriever.get_relevant_documents(f"Full code for {target_class_name}")
+        class_code = "\n\n".join([doc.page_content for doc in retrieved_docs if target_class_name in doc.page_content])
+        if not class_code:
+            class_code = "\n\n".join([doc.page_content for doc in retrieved_docs])
+        if not class_code:
+            class_code = "// ERROR: Could not retrieve main class code from ChromaDB."
+        print("\n[DEBUG] CLASS CODE SENT TO LLM (BATCH MODE):\n" + class_code + "\n[END DEBUG CLASS CODE]\n")
+
+        public_methods = list(self.extract_public_methods(class_code))
+        if not public_methods:
+            print("[ERROR] No public methods found for batch mode generation.")
+            return "// No public methods found to test."
+        batch_size = 5
+        batches = [public_methods[i:i+batch_size] for i in range(0, len(public_methods), batch_size)]
+        test_type = self._detect_test_type(target_info) if target_info else None
+        if test_type is None:
+            test_type = 'service'  # fallback
+
+        # For the first batch, get field declarations from the LLM
+        field_prompt = f"""
+You are an expert Java test developer. For the following class under test, generate ONLY the required field declarations (with @Mock, @InjectMocks, @MockBean, @Autowired, etc.) for a JUnit 5 + Mockito test class. Do NOT generate any test methods, imports, or class header. Output only the field declarations and their annotations.
+
+--- BEGIN CLASS UNDER TEST ---
+{class_code}
+--- END CLASS UNDER TEST ---
+"""
+        field_result = self.llm.invoke(field_prompt)
+        if hasattr(field_result, "content"):
+            field_result = field_result.content
+        field_section = self._extract_field_declarations(field_result)
+        # For controllers, always add MockMvc field if not present
+        if test_type == "controller" and "MockMvc" not in field_section:
+            field_section = "    @Autowired\n    private MockMvc mockMvc;\n" + field_section
+        # Track all field declarations present so far
+        all_fields_so_far = set([l.strip() for l in self._extract_field_declarations_list(field_result)])
+        if test_type == "controller" and "@Autowired" not in all_fields_so_far:
+            all_fields_so_far.add("@Autowired")
+            all_fields_so_far.add("private MockMvc mockMvc;")
+        # Use custom_imports as initial imports
+        imports_section = '\n'.join(custom_imports) if custom_imports else ''
+        # Ensure required imports for @ExtendWith(MockitoExtension.class) are present for service/repository
+        if test_type != "controller":
+            required_service_imports = [
+                'import org.junit.jupiter.api.extension.ExtendWith;',
+                'import org.mockito.junit.jupiter.MockitoExtension;'
+            ]
+            for imp in required_service_imports:
+                if imp not in imports_section:
+                    imports_section = imp + '\n' + imports_section
+        class_anno = "@WebMvcTest({}.class)".format(target_class_name) if test_type == "controller" else "@ExtendWith(MockitoExtension.class)"
+        test_class_code = f"package {target_package_name};\n{imports_section}\n\n{class_anno}\nclass {target_class_name}Test {{\n\n{field_section}\n"
+        test_output_file_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(test_output_file_path, 'w', encoding='utf-8') as f:
+            f.write(test_class_code)
+
+        for i, batch in enumerate(batches):
+            print(f"[BATCH MODE] Generating tests for methods: {batch}")
+            method_list_str = '\n'.join(f'- {m}' for m in batch)
+            # Build prompt
+            prompt = f"""
+You are an expert Java test developer. ONLY generate tests for these methods (do NOT generate tests for any other methods):
+{method_list_str}
+
+--- BEGIN CLASS UNDER TEST ---
+{class_code}
+--- END CLASS UNDER TEST ---
+"""
+            if i > 0:
+                # Add current test class code as context
+                with open(test_output_file_path, 'r', encoding='utf-8') as f:
+                    current_test_code = f.read()
+                prompt += f"\n--- BEGIN EXISTING TEST CLASS ---\n{current_test_code}\n--- END EXISTING TEST CLASS ---\n"
+            prompt += "\nOutput ONLY valid Java test methods for the above methods, to be inserted into the existing test class. Do not repeat class header, imports, or closing brace.\n" \
+                      "At the top of your output, ALWAYS include ALL necessary import statements (including static imports) for every class, static method, or utility used in your test methods. If you use assertEquals, verify, Arrays, etc., you MUST include their imports. Do not omit any required imports. Do not output explanations or markdown."
+            # LLM call
+            result = self.llm.invoke(prompt)
+            if hasattr(result, "content"):
+                result = result.content
+            code = result.strip()
+            code = re.sub(r'^```[a-zA-Z]*\n', '', code)
+            code = re.sub(r'^```', '', code)
+            code = re.sub(r'```$', '', code)
+            code = code.strip()
+            # Extract import statements from LLM output
+            batch_imports = self._extract_import_statements(code)
+            # Extract field declarations from LLM output for this batch
+            batch_fields = self._extract_field_declarations_list(code)
+            # Remove field declarations from code before inserting methods
+            code_wo_fields = '\n'.join([line for line in code.splitlines() if line.strip() not in batch_fields])
+            # Remove import statements from code before inserting methods
+            code_wo_imports = '\n'.join([line for line in code_wo_fields.splitlines() if not line.strip().startswith('import ')])
+            code_wo_imports = self._sanitize_llm_test_methods(code_wo_imports)
+            # Deduplicate test methods: only insert methods whose names are not already present
+            with open(test_output_file_path, 'r', encoding='utf-8') as f:
+                current_test_code = f.read()
+            existing_method_names = self._extract_test_method_names(current_test_code)
+            # Extract new test methods from this batch
+            new_methods = self.extract_all_test_methods(code_wo_imports)
+            deduped_methods = []
+            for m in new_methods:
+                # Extract method name
+                match = re.search(r'void\s+(\w+)\s*\(', m)
+                if match and match.group(1) not in existing_method_names:
+                    deduped_methods.append(m)
+                    existing_method_names.add(match.group(1))
+            # Insert deduped methods before closing brace
+            methods_to_insert = '\n\n'.join(deduped_methods)
+            # Insert methods before closing brace
+            last_brace = current_test_code.rstrip().rfind('}')
+            if last_brace == -1:
+                # Should not happen, fallback: append
+                new_test_code = current_test_code + "\n\n" + methods_to_insert + "\n\n}"
+            else:
+                new_test_code = current_test_code[:last_brace].rstrip() + "\n\n" + methods_to_insert + "\n\n}" + current_test_code[last_brace+1:]
+            with open(test_output_file_path, 'w', encoding='utf-8') as f:
+                f.write(new_test_code)
+            # Update import section with any new imports from this batch
+            self._update_imports_in_test_file(test_output_file_path, batch_imports, f"package {target_package_name};\n")
+            # Update field section with any new fields from this batch
+            new_fields = [f for f in batch_fields if f.strip() and f.strip() not in all_fields_so_far]
+            if new_fields:
+                self._update_fields_in_test_file(test_output_file_path, new_fields)
+                all_fields_so_far.update([f.strip() for f in new_fields])
+            # Compile and run tests
+            test_run_results = self.java_test_runner.run_test(test_output_file_path)
+            compilation_errors = test_run_results['detailed_errors'].get('compilation_errors', [])
+            test_failures = test_run_results['detailed_errors'].get('test_failures', [])
+            tests_run_zero = False
+            stdout = test_run_results.get('stdout', '')
+            test_summary_match = re.search(r"Tests run: (\d+), Failures: (\d+), Errors: (\d+), Skipped: (\d+)", stdout)
+            if test_summary_match:
+                total = int(test_summary_match.group(1))
+                if total == 0:
+                    tests_run_zero = True
+                    print("[WARNING] No tests were run (Tests run: 0). Treating as failure.")
+            if not compilation_errors and not test_failures and not tests_run_zero:
+                print(f"[SUCCESS] Batch {i+1}/{len(batches)}: No compilation or test errors.")
+            else:
+                error_msgs = []
+                if compilation_errors:
+                    print(f"[COMPILATION ERROR] Detected in batch {i+1}:")
+                    for err in compilation_errors:
+                        print(f"  - {err['message']} (at {err['location']})")
+                        error_msgs.append(f"COMPILATION: {err['message']} (at {err['location']})")
+                if test_failures:
+                    print(f"[TEST FAILURE] Detected in batch {i+1}:")
+                    for err in test_failures:
+                        print(f"  - {err['message']} (in {err['location']})")
+                        error_msgs.append(f"TEST: {err['message']} (in {err['location']})")
+                if tests_run_zero:
+                    error_msgs.append("NO TESTS RUN: The generated test class did not contain any executable tests. Ensure at least one @Test method is present and not ignored/skipped.")
+                # Extract full compilation error block from stdout
+                full_compilation_error = self.extract_full_compilation_error(stdout)
+                # Re-prompt with error feedback (simple retry, 1 extra attempt)
+                feedback = '\n'.join(error_msgs)
+                if full_compilation_error:
+                    feedback += '\n\n--- FULL COMPILATION ERROR OUTPUT ---\n' + full_compilation_error + '\n--- END FULL COMPILATION ERROR OUTPUT ---\n'
+                retry_prompt = prompt + f"\n--- ERROR FEEDBACK FROM PREVIOUS ATTEMPT ---\n{feedback}\n--- END ERROR FEEDBACK ---\n"
+                retry_result = self.llm.invoke(retry_prompt)
+                if hasattr(retry_result, "content"):
+                    retry_result = retry_result.content
+                retry_code = retry_result.strip()
+                retry_code = re.sub(r'^```[a-zA-Z]*\n', '', retry_code)
+                retry_code = re.sub(r'^```', '', retry_code)
+                retry_code = re.sub(r'```$', '', retry_code)
+                retry_code = retry_code.strip()
+                retry_batch_fields = self._extract_field_declarations_list(retry_code)
+                retry_code_wo_fields = '\n'.join([line for line in retry_code.splitlines() if line.strip() not in retry_batch_fields])
+                retry_code_wo_imports = '\n'.join([line for line in retry_code_wo_fields.splitlines() if not line.strip().startswith('import ')])
+                retry_code_wo_imports = self._sanitize_llm_test_methods(retry_code_wo_imports)
+                # Update field section with any new fields from retry
+                retry_new_fields = [f for f in retry_batch_fields if f.strip() and f.strip() not in all_fields_so_far]
+                if retry_new_fields:
+                    self._update_fields_in_test_file(test_output_file_path, retry_new_fields)
+                    all_fields_so_far.update([f.strip() for f in retry_new_fields])
+                with open(test_output_file_path, 'r', encoding='utf-8') as f:
+                    current_test_code = f.read()
+                last_brace = current_test_code.rstrip().rfind('}')
+                if last_brace == -1:
+                    new_test_code = current_test_code + "\n\n" + retry_code_wo_imports + "\n\n}"
+                else:
+                    new_test_code = current_test_code[:last_brace].rstrip() + "\n\n" + retry_code_wo_imports + "\n\n}" + current_test_code[last_brace+1:]
+                with open(test_output_file_path, 'w', encoding='utf-8') as f:
+                    f.write(new_test_code)
+                # Extract imports from retry output
+                retry_batch_imports = self._extract_import_statements(retry_code)
+                # Update import section with any new imports from retry
+                self._update_imports_in_test_file(test_output_file_path, retry_batch_imports, f"package {target_package_name};\n")
+                # Re-run tests
+                test_run_results = self.java_test_runner.run_test(test_output_file_path)
+                if not test_run_results['detailed_errors'].get('compilation_errors', []) and not test_run_results['detailed_errors'].get('test_failures', []):
+                    print(f"[SUCCESS] Batch {i+1}/{len(batches)}: Passed after retry.")
+                else:
+                    print(f"[ERROR] Batch {i+1}/{len(batches)}: Still failing after retry. See logs.")
+        print(f"[FINAL SUCCESS] Batch mode test case saved to: '{test_output_file_path}'")
+        with open(test_output_file_path, 'r', encoding='utf-8') as f:
+            final_code = f.read()
+        return final_code
+
+    def extract_full_compilation_error(self, stdout: str) -> str:
+        """
+        Extract the full compilation error block from Maven/Gradle output.
+        Returns the block from '[ERROR] COMPILATION ERROR' to the next '[INFO]' or end of error section.
+        If that block is too short, fallback to collecting all lines starting with [ERROR] and the next 2 lines after each for context.
+        """
+        error_block = []
+        in_error = False
+        for line in stdout.splitlines():
+            if '[ERROR] COMPILATION ERROR' in line:
+                in_error = True
+            if in_error:
+                error_block.append(line)
+                # End block at next [INFO] (but not the starting line)
+                if '[INFO]' in line and len(error_block) > 1:
+                    break
+        # If the block is too short (just header), fallback to all [ERROR] lines and their context
+        if len(error_block) <= 2:
+            error_block = []
+            lines = stdout.splitlines()
+            i = 0
+            while i < len(lines):
+                if lines[i].startswith('[ERROR]'):
+                    # Add this line and the next 2 lines for context
+                    error_block.append(lines[i])
+                    if i+1 < len(lines):
+                        error_block.append(lines[i+1])
+                    if i+2 < len(lines):
+                        error_block.append(lines[i+2])
+                i += 1
+        return '\n'.join(error_block) if error_block else stdout
+
 if __name__ == "__main__":
     try:
         # User can specify build tool via env var or hardcode it here
@@ -1040,76 +1567,58 @@ if __name__ == "__main__":
             relevant_java_files_for_context = resolve_transitive_dependencies(
                 java_file_path_abs, SPRING_BOOT_MAIN_JAVA_DIR
             )
-            # Always include test utility/config files (handled in _update_retriever_filter)
-            relevant_java_files_for_context = list(set(relevant_java_files_for_context)) # Ensure uniqueness
-            
-            # --- Prepare output paths ---
+            relevant_java_files_for_context = list(set(relevant_java_files_for_context))
             paths = get_test_paths(str(relative_processed_txt_path), SPRING_BOOT_PROJECT_ROOT)
             test_output_dir = paths["test_output_dir"]
             test_output_file_path = paths["test_output_file_path"]
-
-            # --- NEW: Check if test file already exists and skip if it does ---
             if test_output_file_path.exists():
                 print(f"\n[SKIP] Test file already exists: '{test_output_file_path}'")
                 print(f"Skipping test generation for {target_class_name}")
                 continue
-
             print("\n" + "="*80)
-            print(f"GENERATING UNIT TEST FOR: {target_class_name} ({target_package_name})") # Updated message
+            print(f"GENERATING UNIT TEST FOR: {target_class_name} ({target_package_name})")
             print(f"SOURCE FILE: {java_file_path_abs}")
             print(f"FILES TO RETRIEVE CHUNKS FROM (for context): {relevant_java_files_for_context}")
             print(f"EXTRACTED CUSTOM IMPORTS (for prompt): {custom_imports_list}")
-            print(f"DATABASE MOCKING REQUIRED: {requires_db_test}") # New print statement
+            print(f"DATABASE MOCKING REQUIRED: {requires_db_test}")
             print(f"EXPECTED TEST OUTPUT PATH: '{test_output_file_path}'")
             print("="*80)
-
             # --- Generate the test case with feedback loop ---
-            # Use simplified method for better reliability
-            USE_SIMPLE_METHOD = False  # Set to False to use complex method
-            
-            if USE_SIMPLE_METHOD:
-                # Get class code directly from the main class file
+            # Use batch mode for large classes
+            public_methods_for_batch = None
+            try:
                 with open(java_file_path_abs, 'r', encoding='utf-8') as f:
-                    class_code = f.read()
-                
-                generated_test_code = test_generator.generate_simple_test_case(
+                    class_code_for_batch = f.read()
+                public_methods_for_batch = list(test_generator.extract_public_methods(class_code_for_batch))
+            except Exception as e:
+                print(f"[WARNING] Could not extract public methods for batch mode decision: {e}")
+            if public_methods_for_batch and len(public_methods_for_batch) > 8:
+                generated_test_code = test_generator.generate_test_case_in_batches(
                     target_class_name=target_class_name,
                     target_package_name=target_package_name,
-                    class_code=class_code,
-                    custom_imports=custom_imports_list
+                    custom_imports=custom_imports_list,
+                    relevant_java_files_for_context=relevant_java_files_for_context,
+                    test_output_file_path=test_output_file_path,
+                    additional_query_instructions="and make sure there are no errors, and you don't cause mismatch in return types and stuff.",
+                    requires_db_test=requires_db_test,
+                    dependency_signatures=None,
+                    target_info=target_info
                 )
-                
-                # Write the generated test code to file
-                test_output_file_path.parent.mkdir(parents=True, exist_ok=True)
-                with open(test_output_file_path, 'w', encoding='utf-8') as f:
-                    f.write(generated_test_code)
-                
-                # Validate the generated test
-                print(f"[VALIDATION] Testing generated test file: {test_output_file_path}")
-                test_results = test_generator.java_test_runner.run_test(test_output_file_path)
-                if test_results['status'] == 'SUCCESS':
-                    print(f"[SUCCESS] Generated test compiles and runs successfully!")
-                else:
-                    print(f"[WARNING] Generated test has issues: {test_results['message']}")
-                    print("Consider reviewing the generated test manually.")
             else:
-                # Use the complex method (original)
                 generated_test_code = test_generator.generate_test_case(
                     target_class_name=target_class_name,
                     target_package_name=target_package_name,
                     custom_imports=custom_imports_list,
                     relevant_java_files_for_context=relevant_java_files_for_context,
-                    test_output_file_path=test_output_file_path, # Pass the output path
+                    test_output_file_path=test_output_file_path,
                     additional_query_instructions="and make sure there are no errors, and you don't cause mismatch in return types and stuff.",
-                    requires_db_test=requires_db_test, # Pass the flag to the prompt template
-                    dependency_signatures=None, # Pass None for now, as dependency_signatures are not provided in the input
-                    target_info=target_info # Pass the target_info for test type detection
+                    requires_db_test=requires_db_test,
+                    dependency_signatures=None,
+                    target_info=target_info
                 )
-            
             print(f"\n[FINAL SUCCESS] Generated test case saved to: '{test_output_file_path}'")
-
             print("\n--- FINAL GENERATED TEST CASE (Printed to Console for review) ---")
-            print(generated_test_code) # Corrected variable name
+            print(generated_test_code)
             print("\n" + "="*80 + "\n")
             
         # --- NEW: Run full project verification after all tests are generated ---
