@@ -1360,10 +1360,22 @@ You are an expert Java test developer. For the following class under test, gener
             print(f"[BATCH MODE] Generating tests for methods: {batch}")
             method_list_str = '\n'.join(f'- {m}' for m in batch)
             # Build prompt
+            strict_controller_requirements = ""
+            if test_type == "controller":
+                strict_controller_requirements = f"""
+STRICT REQUIREMENTS for Controller Tests:
+- Use @WebMvcTest({target_class_name}.class) for the test class.
+- Use @Autowired MockMvc mockMvc; for HTTP request simulation.
+- Use @MockBean for all service/repository dependencies.
+- NEVER use @InjectMocks or @Mock for the controller or its dependencies.
+- All test methods must use mockMvc.perform(...) to simulate HTTP requests.
+- Do NOT instantiate the controller or call its methods directly.
+- Do NOT use Mockito to mock the controller itself.
+"""
             prompt = f"""
 You are an expert Java test developer. ONLY generate tests for these methods (do NOT generate tests for any other methods):
 {method_list_str}
-
+{strict_controller_requirements}
 --- BEGIN CLASS UNDER TEST ---
 {class_code}
 --- END CLASS UNDER TEST ---
