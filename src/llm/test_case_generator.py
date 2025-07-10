@@ -184,7 +184,7 @@ class TestCaseGenerator:
             raise ValueError("GOOGLE_API_KEY environment variable is not set. Cannot initialize Gemini LLM.")
         
         print(f"Using Google Gemini LLM: {LLM_MODEL_NAME_GEMINI}...")
-        return ChatGoogleGenerativeAI(model=LLM_MODEL_NAME_GEMINI, temperature=0.2)
+        return ChatGoogleGenerativeAI(model=LLM_MODEL_NAME_GEMINI, temperature=0.1)
 
     def _update_retriever_filter(self, main_class_filename: str, dependency_filenames: List[str], utility_filenames: List[str] = None, k_override: int = None):
         """
@@ -791,14 +791,18 @@ Instructions:
             if import_lines:
                 imports_section = '--- BEGIN IMPORTS ---\n' + '\n'.join(import_lines) + '\n--- END IMPORTS ---\n\n'
             minimal_class_code = extract_minimal_class_for_methods(main_code, batch)
-            # --- NEW: For dependencies, only include used signatures ---
+            # --- PATCH: Use transitive dependency resolution for all referenced types ---
+            # Use resolve_transitive_dependencies to get all .java files referenced by the batch methods
+            from analyzer.code_analysis_utils import resolve_transitive_dependencies
+            transitive_deps = resolve_transitive_dependencies(Path(target_info['java_file_path_abs']), SPRING_BOOT_MAIN_JAVA_DIR)
+            # Remove the main class itself from dependencies
+            transitive_deps = [dep for dep in transitive_deps if Path(dep).name != main_class_filename]
             dep_signatures = []
-            for dep in all_deps:
-                if dep == main_class_filename:
-                    continue
-                dep_code = self._get_full_code_from_chromadb(dep)
+            for dep_path in transitive_deps:
+                dep_filename = Path(dep_path).name
+                dep_code = self._get_full_code_from_chromadb(dep_filename)
                 dep_sign = extract_class_signatures(dep_code)
-                dep_signatures.append(f"--- BEGIN DEPENDENCY SIGNATURES: {dep} ---\n{dep_sign}\n--- END DEPENDENCY SIGNATURES: {dep} ---\n")
+                dep_signatures.append(f"--- BEGIN DEPENDENCY SIGNATURES: {dep_filename} ---\n{dep_sign}\n--- END DEPENDENCY SIGNATURES: {dep_filename} ---\n")
             # Build the minimal context
             minimal_context = imports_section
             minimal_context += f"--- BEGIN MAIN CLASS UNDER TEST (MINIMAL) ---\n{minimal_class_code}\n--- END MAIN CLASS UNDER TEST (MINIMAL) ---\n\n"
@@ -910,13 +914,19 @@ You must generate a complete test class named {target_class_name}Test in package
 --- ENDPOINTS UNDER TEST ---
 {endpoints_list_str}
 --- END ENDPOINTS ---
+
 You are an expert Java test developer. Here is the current test class for {target_class_name}:
 --- BEGIN EXISTING TEST CLASS ---
 {current_test_code}
 --- END EXISTING TEST CLASS ---
 
-Add new test methods for ONLY these methods:
+STRICT INSTRUCTIONS:
+- Retain all previously generated test methods and class structure.
+- Add new test methods for ONLY these methods:
 {method_list_str}
+- Do NOT remove or modify any existing test methods unless you are fixing errors.
+- The final test class must contain all previously generated test methods plus the new ones for this batch.
+- Output the complete, compilable test class.
 
 {context}
 """
@@ -931,6 +941,8 @@ Add new test methods for ONLY these methods:
                     prompt = re.sub(r'\n{3,}', '\n\n', prompt)
                 # Print the prompt for every batch attempt
                 print(f"\n[BATCH {i+1} RETRY {retries}] PROMPT SENT TO LLM:\n" + prompt + "\n[END PROMPT]\n")
+                # Debug print: show minimal class code for this batch
+                print(f"[DEBUG] Minimal class code for batch {i+1}, retry {retries} (methods: {batch}):\n--- BEGIN MINIMAL CLASS CODE ---\n{minimal_class_code}\n--- END MINIMAL CLASS CODE ---\n")
                 result = self.llm.invoke(prompt)
                 if hasattr(result, "content"):
                     result = result.content
@@ -1648,6 +1660,7 @@ def extract_minimal_class_for_methods(java_code: str, method_names: list) -> str
     - All fields
     - The specified methods (with annotations, signatures, and bodies)
     - Any private/helper methods directly called by the batch methods (recursively)
+    - Any inner classes referenced by included methods
     - PATCH: For each method, include all method-level annotations (lines starting with '@' immediately above the method signature)
     """
     import re
@@ -1655,25 +1668,8 @@ def extract_minimal_class_for_methods(java_code: str, method_names: list) -> str
         tree = javalang.parse.parse(java_code)
     except Exception as e:
         print(f"[extract_minimal_class_for_methods] javalang parse error: {e}")
-        # Fallback: extract class header and all fields, and only the batch methods by regex
-        class_header = re.search(r'((@[^\n]+\n)*public class [\w<>]+[^{]*\{)', java_code)
-        header = class_header.group(1) if class_header else 'public class Dummy {'
-        # Extract all fields (lines ending with ';' before any method)
-        field_lines = []
-        for line in java_code.splitlines():
-            if re.match(r'\s*(public|private|protected)?\s*[\w<\>\[\]]+\s+[\w, ]+;', line):
-                field_lines.append(line)
-        # Extract methods by name, including annotations
-        method_blocks = []
-        for m in method_names:
-            # Find the method signature
-            pat = re.compile(r'(\s*@[^\n]+\n)*\s*(public|private|protected)?[\s\w<>,\[\]]*\s+' + re.escape(m) + r'\s*\([^)]*\)\s*\{[\s\S]*?^\}', re.MULTILINE)
-            match = pat.search(java_code)
-            if match:
-                method_blocks.append(match.group(0))
-        result = header + '\n' + '\n'.join(field_lines) + '\n' + '\n'.join(method_blocks) + '\n}'
-        print("[extract_minimal_class_for_methods] Fallback minimal class used (with method annotations).")
-        return result
+        # Instead of fallback, raise an error to avoid broken minimal class code
+        raise RuntimeError(f"Failed to parse Java code for minimal class extraction: {e}")
     # Find the main class
     main_class = None
     for type_decl in tree.types:
@@ -1769,9 +1765,46 @@ def extract_minimal_class_for_methods(java_code: str, method_names: list) -> str
             add_called_helpers(method_map[m])
     # Collect method sources (with annotations)
     method_lines = []
+    referenced_inner_classes = set()
     for m in main_class.methods:
         if m.name in to_include:
-            method_lines.append(get_method_src_with_annotations(m))
+            src = get_method_src_with_annotations(m)
+            method_lines.append(src)
+            # Find referenced inner classes in this method
+            # Simple heuristic: look for capitalized identifiers that match inner class names
+            # Find all inner class names in the main class
+    inner_class_nodes = [node for node in main_class.body if isinstance(node, javalang.tree.ClassDeclaration)]
+    inner_class_names = {ic.name for ic in inner_class_nodes}
+    # Find referenced inner classes in all included methods
+    for src in method_lines:
+        for cname in inner_class_names:
+            if re.search(r'\b' + re.escape(cname) + r'\b', src):
+                referenced_inner_classes.add(cname)
+    # Collect inner class code
+    inner_class_code_blocks = []
+    for ic in inner_class_nodes:
+        if ic.name in referenced_inner_classes:
+            # Try to extract the code block for this inner class from the original code
+            if hasattr(ic, 'position') and ic.position:
+                start = ic.position[0] - 1
+                # Find the end by matching braces
+                lines = java_code.splitlines()[start:]
+                brace_count = 0
+                class_lines = []
+                started = False
+                for l in lines:
+                    if '{' in l:
+                        brace_count += l.count('{')
+                        started = True
+                    if '}' in l:
+                        brace_count -= l.count('}')
+                    class_lines.append(l)
+                    if started and brace_count == 0:
+                        break
+                inner_class_code_blocks.append('\n'.join(class_lines))
+            else:
+                # Fallback: just output class header
+                inner_class_code_blocks.append(f"class {ic.name} {{ ... }}")
     # Assemble minimal class
     result = ''
     if class_annos:
@@ -1781,6 +1814,8 @@ def extract_minimal_class_for_methods(java_code: str, method_names: list) -> str
         result += f + '\n'
     for m in method_lines:
         result += m + '\n'
+    for icb in inner_class_code_blocks:
+        result += icb + '\n'
     result += '}'
     return result
 
