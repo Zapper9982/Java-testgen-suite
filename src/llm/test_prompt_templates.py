@@ -309,62 +309,63 @@ def get_controller_test_prompt_template(target_class_name, target_package_name, 
     if dependency_signatures:
         dependency_sig_section = '\n'.join([f"// Dependency: {k}: {v}" for k, v in dependency_signatures.items()])
     return f"""
-// BAD EXAMPLE (NEVER do this for controllers):
+// GOOD EXAMPLE (DO THIS):
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
+import org.mockito.MockitoAnnotations;
 import org.mockito.junit.jupiter.MockitoExtension;
-import static org.mockito.Mockito.*;
+import org.springframework.http.MediaType;
+import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.test.web.servlet.setup.MockMvcBuilders;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.when;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 @ExtendWith(MockitoExtension.class)
-class UserControllerTest {{
-    @Mock UserService userService;
-    @InjectMocks UserController userController;
-    @Test void testSomething() {{ /* ... */ }}
-}}
-// NEVER use @InjectMocks or @Mock for controllers!
+class ExampleControllerTest {{
+    private MockMvc mockMvc;
 
-// GOOD EXAMPLE (DO THIS):
-import org.junit.jupiter.api.Test;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
-import org.springframework.boot.test.mock.mockito.MockBean;
-import org.springframework.test.web.servlet.MockMvc;
-import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
-import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
+    @Mock
+    private ExampleService exampleService;
 
-@WebMvcTest(UserController.class)
-class UserControllerTest {{
-    @Autowired MockMvc mockMvc;
-    @MockBean UserService userService;
-    @Test void shouldReturnUser_whenUserExists() throws Exception {{
-        when(userService.findByName("alice")).thenReturn(new User("alice"));
-        mockMvc.perform(get("/users/alice"))
-            .andExpect(status().isOk())
-            .andExpect(jsonPath("$.name").value("alice"));
+    @InjectMocks
+    private ExampleController controller;
+
+    @BeforeEach
+    void setUp() {{
+        MockitoAnnotations.openMocks(this);
+        mockMvc = MockMvcBuilders.standaloneSetup(controller).build();
+    }}
+
+    @Test
+    void shouldReturnData_whenGetIsSuccessful() throws Exception {{
+        when(exampleService.getData(anyString())).thenReturn("mockData");
+        mockMvc.perform(get("/example/get/{id}", "1")
+                .accept(MediaType.APPLICATION_JSON))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data").value("mockData"));
     }}
 }}
 
-DO NOT USE:
-- @InjectMocks or @Mock for controllers
-- Mockito for controller dependencies
-ONLY USE:
-- @WebMvcTest, @MockBean, and MockMvc
-
-You are an expert Java Spring Boot test generator. Your task is to generate a JUnit 5 test class for the controller `{target_class_name}` in the package `{target_package_name}`.
-
-STRICT REQUIREMENTS:
-- Output ONLY compilable Java code, no explanations or markdown.
-- Use @WebMvcTest({target_class_name}.class) for the test class annotation.
-- Use @MockBean for all dependencies (not @Mock).
-- Inject MockMvc using @Autowired.
-- For each public endpoint method, generate at least one test method that:
-    - Uses MockMvc to perform HTTP requests (e.g., mockMvc.perform(...)).
-    - Asserts HTTP status, response body, and side effects using andExpect and other assertions.
-    - Mocks service/repository dependencies using @MockBean and Mockito (when, doReturn, etc.).
-    - Covers both typical and edge cases, including exception paths.
+STRICT REQUIREMENTS for Standalone Controller Tests:
+- Use @ExtendWith(MockitoExtension.class) for the test class.
+- Use @InjectMocks for the controller under test.
+- Use @Mock for all service/repository dependencies.
+- Do NOT use @WebMvcTest, @MockBean, or @Autowired.
+- Initialize MockMvc in a @BeforeEach method using MockMvcBuilders.standaloneSetup(controller).build();
+- All test methods must use mockMvc.perform(...) to simulate HTTP requests.
+- Do NOT instantiate the controller manually (use @InjectMocks).
+- Do NOT use Spring context injection.
+- Output only valid, compilable Java code for the test class, no explanations or markdown.
 - Use descriptive test method names (e.g., shouldReturnXWhenY).
-- Never instantiate dependencies manually—always use dependency injection and mocking.
+- Cover both typical and edge cases, including exception paths.
+- Never instantiate dependencies manually—always use @Mock and @InjectMocks.
 - Do NOT hallucinate methods, fields, helpers, or imports—use only what is present in the provided context and imports.
 - Do NOT invent or use any methods, fields, classes, or helpers not present in the provided code.
 - If you are unsure, leave it out or add a comment.

@@ -149,6 +149,26 @@ class JavaTestRunner:
                 "location": f"{test_class}.{test_method}",
                 "suggested_fix": suggested_fix
             })
+        # Additional regex for simple assertion failures (no stack trace, just a line)
+        simple_failure_pattern = re.compile(r"\[ERROR\]\s+([\w.$]+)\.(\w+):(\d+)\s+(.*)")
+        for match in simple_failure_pattern.finditer(stdout):
+            test_class = match.group(1)
+            test_method = match.group(2)
+            line_num = match.group(3)
+            message = match.group(4).strip()
+            # Avoid duplicates if already captured by the main pattern
+            if not any(f["test_class"] == test_class and f["test_method"] == test_method for f in errors["test_failures"]):
+                errors["test_failures"].append({
+                    "test_class": test_class,
+                    "test_method": test_method,
+                    "failure_type": "AssertionError",
+                    "message": message,
+                    "expected": None,
+                    "actual": None,
+                    "stack_trace": None,
+                    "location": f"{test_class}.{test_method}:{line_num}",
+                    "suggested_fix": "Check the assertion and the expected/actual values. Fix the test or the code under test."
+                })
         # (General messages unchanged)
         if not errors["compilation_errors"] and not errors["test_failures"] and not errors["general_messages"] and ("BUILD FAILURE" in stdout or "BUILD ERROR" in stdout):
             errors["general_messages"].append("Maven build failed for an unparsed reason. Full output might be needed.")
@@ -192,11 +212,15 @@ class JavaTestRunner:
                     else:
                         status = "FAILED"
                         message = f"Tests completed with {failures} failures, {errors_count} errors."
-                    
                     summary = {"total": total, "failures": failures, "errors": errors_count, "skipped": skipped}
                 else:
-                    status = "SUCCESS" # Assume success if build success but no test summary (e.g., compile only)
-                    message = "Maven build successful (no test summary found)." # More descriptive message
+                    # Check for test failures in output even if summary not found
+                    if "[ERROR] There are test failures." in stdout:
+                        status = "FAILED"
+                        message = "Tests completed with failures (see output for details)."
+                    else:
+                        status = "SUCCESS" # Assume success if build success but no test summary (e.g., compile only)
+                        message = "Maven build successful (no test summary found)." # More descriptive message
                     summary = None # No test summary available
             else: # Build failed or errored
                 status = "FAILED"

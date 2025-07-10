@@ -7,6 +7,7 @@ from typing import List, Dict, Any, Union
 import re
 from dotenv import load_dotenv
 load_dotenv()
+import javalang
 
 
 
@@ -549,6 +550,18 @@ Instructions:
             result = result.content
         return result.strip()
 
+    def _get_direct_local_imports(self, class_code: str, project_root: Path) -> list:
+        """
+        Parse import statements from the class code and return a list of local Java filenames (e.g., 'UserAgentUtil.java') that are directly imported and start with 'com.iemr.'
+        """
+        import_pattern = re.compile(r'^import\s+(com\.iemr\.[\w\.]+);', re.MULTILINE)
+        local_files = set()
+        for match in import_pattern.finditer(class_code):
+            fqcn = match.group(1)
+            class_name = fqcn.split('.')[-1]
+            local_files.add(f'{class_name}.java')
+        return list(local_files)
+
     def generate_test_case(self, 
                            target_class_name: str, 
                            target_package_name: str, 
@@ -559,49 +572,51 @@ Instructions:
                            requires_db_test: bool,
                            dependency_signatures: Dict[str, str] = None,
                            target_info: Dict[str, Any] = None) -> str:
-        # --- Early exit if test file already exists ---
         if test_output_file_path.exists():
             print(f"[SKIP] Test file already exists (inside generate_test_case): '{test_output_file_path}'")
             print(f"Skipping test generation for {target_class_name} (generate_test_case)")
             return ""
 
-        # Retrieve the full class code for the main class under test
         main_class_filename = Path(target_info['java_file_path_abs']).name if target_info else None
-        dependency_filenames = [Path(f).name for f in relevant_java_files_for_context if Path(f).name != main_class_filename]
-        utility_filenames = [Path(f).name for f in relevant_java_files_for_context if Path(f).name not in dependency_filenames and Path(f).name != main_class_filename]
-        self._update_retriever_filter(main_class_filename, dependency_filenames, utility_filenames, k_override=5)
-        retrieved_docs = self.retriever.get_relevant_documents(f"Full code for {target_class_name}")
-        class_code = "\n\n".join([doc.page_content for doc in retrieved_docs if target_class_name in doc.page_content])
-        if not class_code:
-            class_code = "\n\n".join([doc.page_content for doc in retrieved_docs])
-        if not class_code:
-            class_code = "// ERROR: Could not retrieve main class code from ChromaDB."
-        print("\n[DEBUG] CLASS CODE SENT TO LLM (FULL):\n" + class_code + "\n[END DEBUG CLASS CODE]\n")
-
-        public_methods = self.extract_public_methods(class_code)
+        with open(target_info['java_file_path_abs'], 'r', encoding='utf-8') as f:
+            main_class_code = f.read()
+        direct_local_deps = self._get_direct_local_imports(main_class_code, SPRING_BOOT_MAIN_JAVA_DIR)
+        all_deps = direct_local_deps
+        print(f"[STRICT DEBUG] Main class: {main_class_filename}, Direct local deps: {all_deps}")
+        print(f"FILES TO RETRIEVE CHUNKS FROM (for context): {[main_class_filename] + all_deps}")
+        files_for_context = [main_class_filename] + all_deps
+        print(f"[DEBUG] Actually retrieving code for these files: {files_for_context}")
+        context = f"--- BEGIN MAIN CLASS UNDER TEST ---\n"
+        main_code = self._get_full_code_from_chromadb(main_class_filename)
+        context += main_code + "\n--- END MAIN CLASS UNDER TEST ---\n\n"
+        for dep in all_deps:
+            if dep == main_class_filename:
+                continue
+            dep_code = self._get_full_code_from_chromadb(dep)
+            context += f"--- BEGIN DEPENDENCY: {dep} ---\n{dep_code}\n--- END DEPENDENCY: {dep} ---\n\n"
+        # Now, use 'context' in the prompt
+        public_methods = self.extract_public_methods(context)
         test_type = self._detect_test_type(target_info) if target_info else None
         if test_type is None:
             test_type = 'service'  # fallback
-
-        # Select the correct prompt template
         if test_type == 'controller':
             prompt_template = get_controller_test_prompt_template(
                 target_class_name, target_package_name, custom_imports, additional_query_instructions
             )
+            # Add strict instruction to not generate code for dependencies
+            prompt_template += "\nSTRICT: Do NOT generate any code for dependencies. Only generate the test class for the controller. Assume all dependencies exist and are available for mocking.\n"
         else:
             prompt_template = get_service_test_prompt_template(
                 target_class_name, target_package_name, custom_imports, additional_query_instructions
             )
-
-        # Feedback-driven generation loop
         max_retries = MAX_TEST_GENERATION_RETRIES
         error_feedback = None
         last_valid_code = None
         for attempt in range(max_retries):
-            prompt = prompt_template
+            prompt = prompt_template.replace('{context}', context)
             if error_feedback and attempt > 0:
                 prompt += f"\n--- ERROR FEEDBACK FROM PREVIOUS ATTEMPT ---\n{error_feedback}\n--- END ERROR FEEDBACK ---\n"
-            result = self.llm.invoke(prompt.replace('{context}', class_code))
+            result = self.llm.invoke(prompt)
             if hasattr(result, "content"):
                 result = result.content
             code = result.strip()
@@ -609,82 +624,10 @@ Instructions:
             code = re.sub(r'^```', '', code)
             code = re.sub(r'```$', '', code)
             code = code.strip()
-
-            # --- NEW: Post-process LLM output for imports/fields/structure ---
-            # Extract package statement
-            package_stmt = ''
-            package_match = re.search(r'^(package\s+[^;]+;)', code, re.MULTILINE)
-            if package_match:
-                package_stmt = package_match.group(1)
-            else:
-                package_stmt = f'package {target_package_name};'
-            # Extract import statements
-            batch_imports = self._extract_import_statements(code)
-            # For service/repository, ensure required imports
-            if test_type != "controller":
-                required_service_imports = [
-                    'import org.junit.jupiter.api.extension.ExtendWith;',
-                    'import org.mockito.junit.jupiter.MockitoExtension;'
-                ]
-                for imp in required_service_imports:
-                    if imp not in batch_imports:
-                        batch_imports.insert(0, imp)
-            # Extract field declarations
-            batch_fields = self._extract_field_declarations_list(code)
-            # For controllers, ensure @Autowired MockMvc is present
-            if test_type == "controller":
-                has_mockmvc = any('MockMvc' in f for f in batch_fields)
-                if not has_mockmvc:
-                    batch_fields.insert(0, '@Autowired')
-                    batch_fields.insert(1, 'private MockMvc mockMvc;')
-            # Deduplicate imports and fields
-            batch_imports = list(dict.fromkeys(batch_imports))
-            batch_fields = list(dict.fromkeys(batch_fields))
-            # Extract class annotation and header
-            class_anno = "@WebMvcTest({}.class)".format(target_class_name) if test_type == "controller" else "@ExtendWith(MockitoExtension.class)"
-            class_header_match = re.search(r'(class\s+\w+Test\s*\{)', code)
-            if class_header_match:
-                class_header = class_header_match.group(1)
-            else:
-                class_header = f'class {target_class_name}Test {{'
-            # Extract all lines after the class header (methods, etc.)
-            class_body = ''
-            class_header_idx = code.find(class_header)
-            if class_header_idx != -1:
-                class_body = code[class_header_idx + len(class_header):]
-                # Remove closing brace if present
-                if class_body.rstrip().endswith('}'): class_body = class_body.rstrip()[:-1]
-            else:
-                # Fallback: try to find first '{' and take everything after
-                first_brace = code.find('{')
-                if first_brace != -1:
-                    class_body = code[first_brace+1:]
-                    if class_body.rstrip().endswith('}'): class_body = class_body.rstrip()[:-1]
-                else:
-                    class_body = code
-            # Remove field declarations from class_body (they'll be inserted after header)
-            for f in batch_fields:
-                class_body = class_body.replace(f, '')
-            # Remove import/package/class header/annotation lines from class_body
-            class_body = re.sub(r'^package\s+[^;]+;\s*', '', class_body, flags=re.MULTILINE)
-            class_body = re.sub(r'^import\s+[^;]+;\s*', '', class_body, flags=re.MULTILINE)
-            class_body = re.sub(r'^@WebMvcTest\([^)]*\)\s*', '', class_body, flags=re.MULTILINE)
-            class_body = re.sub(r'^@ExtendWith\([^)]*\)\s*', '', class_body, flags=re.MULTILINE)
-            class_body = re.sub(r'^class\s+\w+Test\s*\{\s*', '', class_body, flags=re.MULTILINE)
-            # Re-assemble test class
-            new_code = f"{package_stmt}\n"
-            if batch_imports:
-                new_code += '\n'.join(batch_imports) + '\n\n'
-            new_code += f"{class_anno}\n{class_header}\n\n"
-            if batch_fields:
-                for f in batch_fields:
-                    new_code += '    ' + f + '\n'
-                new_code += '\n'
-            new_code += class_body.strip() + '\n\n}'
             # Write to file
             test_output_file_path.parent.mkdir(parents=True, exist_ok=True)
             with open(test_output_file_path, 'w', encoding='utf-8') as f:
-                f.write(new_code)
+                f.write(code)
             # Run the test file
             test_run_results = self.java_test_runner.run_test(test_output_file_path)
             compilation_errors = test_run_results['detailed_errors'].get('compilation_errors', [])
@@ -699,7 +642,7 @@ Instructions:
                     print("[WARNING] No tests were run (Tests run: 0). Treating as failure.")
             if not compilation_errors and not test_failures and not tests_run_zero:
                 print(f"[SUCCESS] No compilation or test errors after {attempt+1} attempt(s).")
-                last_valid_code = new_code
+                last_valid_code = code
                 break
             else:
                 error_msgs = []
@@ -715,12 +658,12 @@ Instructions:
                         error_msgs.append(f"TEST: {err['message']} (in {err['location']})")
                 if tests_run_zero:
                     error_msgs.append("NO TESTS RUN: The generated test class did not contain any executable tests. Ensure at least one @Test method is present and not ignored/skipped.")
-                # Extract full compilation error block from stdout
                 full_compilation_error = self.extract_full_compilation_error(stdout)
                 print("\n[DEBUG] FULL COMPILATION ERROR BLOCK EXTRACTED:\n" + (full_compilation_error or '[EMPTY]') + "\n[END DEBUG FULL COMPILATION ERROR BLOCK]\n")
                 error_feedback = '\n'.join(error_msgs)
                 if full_compilation_error:
                     error_feedback += '\n\n--- FULL COMPILATION ERROR OUTPUT ---\n' + full_compilation_error + '\n--- END FULL COMPILATION ERROR OUTPUT ---\n'
+                retries += 1
         if last_valid_code:
             print(f"[FINAL SUCCESS] Generated test case saved to: '{test_output_file_path}'")
             return last_valid_code
@@ -728,35 +671,310 @@ Instructions:
             print(f"[ERROR] Test generation failed for {target_class_name} after {max_retries} attempts. See logs for details.")
             return "// Test not generated: failed after feedback loop."
 
+    def generate_test_case_in_batches(
+        self,
+        target_class_name: str,
+        target_package_name: str,
+        custom_imports: List[str],
+        relevant_java_files_for_context: List[str],
+        test_output_file_path: Path,
+        additional_query_instructions: str,
+        requires_db_test: bool,
+        dependency_signatures: Dict[str, str] = None,
+        target_info: Dict[str, Any] = None
+    ) -> str:
+        """
+        Batch mode: For every batch, send the full code of the main class and only directly imported local dependencies (from ChromaDB) in the prompt context.
+        Also print the full prompt before each LLM call for debugging/verification.
+        """
+        if test_output_file_path.exists():
+            print(f"[SKIP] Test file already exists (inside generate_test_case_in_batches): '{test_output_file_path}'")
+            print(f"Skipping test generation for {target_class_name} (generate_test_case_in_batches)")
+            return ""
+
+        main_class_filename = Path(target_info['java_file_path_abs']).name if target_info else None
+        with open(target_info['java_file_path_abs'], 'r', encoding='utf-8') as f:
+            main_class_code = f.read()
+        direct_local_deps = self._get_direct_local_imports(main_class_code, SPRING_BOOT_MAIN_JAVA_DIR)
+        all_deps = direct_local_deps
+        print(f"[STRICT DEBUG] Main class: {main_class_filename}, Direct local deps: {all_deps}")
+        print(f"FILES TO RETRIEVE CHUNKS FROM (for context): {[main_class_filename] + all_deps}")
+        files_for_context = [main_class_filename] + all_deps
+        print(f"[DEBUG] Actually retrieving code for these files: {files_for_context}")
+        test_type = self._detect_test_type(target_info) if target_info else None
+        if test_type is None:
+            test_type = 'service'  # fallback
+        full_context = f"--- BEGIN MAIN CLASS UNDER TEST ---\n"
+        # Use the full .java file for the main class code
+        with open(target_info['java_file_path_abs'], 'r', encoding='utf-8') as f:
+            main_code = f.read()
+        full_context += main_code + "\n--- END MAIN CLASS UNDER TEST ---\n\n"
+        if test_type != "controller":
+            for dep in all_deps:
+                if dep == main_class_filename:
+                    continue
+                dep_code = self._get_full_code_from_chromadb(dep)
+                dep_signatures = extract_class_signatures(dep_code)
+                full_context += f"--- BEGIN DEPENDENCY SIGNATURES: {dep} ---\n{dep_signatures}\n--- END DEPENDENCY SIGNATURES: {dep} ---\n\n"
+        # Extract public methods and endpoint map from the main class code only (not from full_context)
+        with open(target_info['java_file_path_abs'], 'r', encoding='utf-8') as f:
+            main_class_code = f.read()
+        # Use javalang to extract both public methods and endpoint paths
+        public_methods = set()
+        endpoint_map = {}
+        try:
+            tree = javalang.parse.parse(main_class_code)
+            main_class = None
+            for type_decl in tree.types:
+                if isinstance(type_decl, javalang.tree.ClassDeclaration):
+                    main_class = type_decl
+                    break
+            if main_class:
+                for method in main_class.methods:
+                    if 'public' in method.modifiers:
+                        public_methods.add(method.name)
+                        # Look for REST endpoint annotations
+                        endpoint = None
+                        if method.annotations:
+                            for ann in method.annotations:
+                                ann_name = ann.name.lower()
+                                if ann_name in [
+                                    'getmapping', 'postmapping', 'putmapping', 'deletemapping', 'patchmapping', 'requestmapping'
+                                ]:
+                                    # Try to extract the path value
+                                    if ann.element:
+                                        # Handles @GetMapping(path = "/foo") or @GetMapping("/foo")
+                                        if hasattr(ann.element, 'value') and ann.element.value:
+                                            endpoint = ann.element.value.value if hasattr(ann.element.value, 'value') else str(ann.element.value)
+                                        elif hasattr(ann.element, 'pairs') and ann.element.pairs:
+                                            for pair in ann.element.pairs:
+                                                if pair.name == 'path' or pair.name == 'value':
+                                                    endpoint = pair.value.value if hasattr(pair.value, 'value') else str(pair.value)
+                                    elif ann.element is not None:
+                                        endpoint = str(ann.element)
+                        if endpoint:
+                            endpoint_map[method.name] = endpoint
+        except Exception as e:
+            print(f"[extract_public_methods] javalang parse error: {e}")
+        public_methods = list(public_methods)
+        if not public_methods:
+            print("[ERROR] No public methods found for batch mode generation.")
+            return "// No public methods found to test."
+        batch_size = 3
+        batches = [public_methods[i:i+batch_size] for i in range(0, len(public_methods), batch_size)]
+        final_code = None
+        for i, batch in enumerate(batches):
+            # --- ADDED: Check for batch method name mismatches ---
+            batch_set = set(batch)
+            public_methods_set = set(public_methods)
+            if not batch_set.issubset(public_methods_set):
+                missing = batch_set - public_methods_set
+                print(f"[WARNING] Batch {i+1} contains method names not in extracted public methods: {missing}")
+            print(f"\n[INFO] Generating test case for batch {i+1}/{len(batches)} with these public methods: {batch}\n")
+            # Build endpoints list for this batch (force-apply fix)
+            endpoints_list = []
+            for m in batch:
+                if m in endpoint_map:
+                    endpoints_list.append(f"- {m}: {endpoint_map[m]}")
+            endpoints_list_str = '\n'.join(endpoints_list)
+            print(f"[BATCH MODE] Generating tests for methods: {batch}")
+            method_list_str = '\n'.join(f'- {m}' for m in batch)
+            retries = 0  # Always define retries at the start of the batch
+            success = False
+            error_feedback = None
+            while retries < 15 and not success:
+                context = full_context  # Always use full context for every batch
+                if test_type == "controller":
+                    good_example = '''
+// GOOD EXAMPLE (DO THIS):
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.InjectMocks;
+import org.mockito.Mock;
+import org.mockito.MockitoAnnotations;
+import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.test.web.servlet.setup.MockMvcBuilders;
+
+@ExtendWith(MockitoExtension.class)
+class MyControllerTest {
+    private MockMvc mockMvc;
+    @Mock MyService myService;
+    @InjectMocks MyController controller;
+
+    @BeforeEach
+    void setUp() {
+        MockitoAnnotations.openMocks(this);
+        mockMvc = MockMvcBuilders.standaloneSetup(controller).build();
+    }
+
+    @Test
+    void shouldDoSomething() throws Exception {
+        // test logic using mockMvc
+    }
+}
+'''
+                    forbidden = """
+STRICT REQUIREMENTS:
+- You MUST use standalone MockMvc with Mockito: @ExtendWith(MockitoExtension.class), @InjectMocks for the controller, @Mock for dependencies, and initialize MockMvc in @BeforeEach using MockMvcBuilders.standaloneSetup(controller).
+- Do NOT use @WebMvcTest, @MockBean, @Autowired, or @SpringBootTest for controllers.
+- Do NOT use field injection for MockMvc or dependencies.
+- Do NOT generate any code for dependencies. Only generate the test class for the controller. Assume all dependencies exist and are available for mocking.
+- If you use any forbidden annotation or pattern, you will be penalized and re-prompted.
+- Output ONLY compilable Java code, no explanations or markdown.
+"""
+                    dependencies_context = ''  # No dependencies for controllers in batch mode
+                    if i == 0 and retries == 0:
+                        prompt = f"""{good_example}
+{forbidden}
+--- ENDPOINTS UNDER TEST ---
+{endpoints_list_str}
+--- END ENDPOINTS ---
+--- BEGIN MAIN CLASS UNDER TEST ---
+{main_code}
+--- END MAIN CLASS UNDER TEST ---
+
+You must generate a complete test class named {target_class_name}Test in package {target_package_name}, covering ONLY these methods:
+{method_list_str}
+"""
+                    elif i == 0 and retries > 0:
+                        with open(test_output_file_path, 'r', encoding='utf-8') as f:
+                            failed_test_code = f.read()
+                        prompt = f"""
+{good_example}
+{forbidden}
+--- ENDPOINTS UNDER TEST ---
+{endpoints_list_str}
+--- END ENDPOINTS ---
+The previous output failed to compile/run with the following errors:
+{error_feedback}
+
+Here is the test class that failed:
+--- BEGIN FAILED TEST CLASS ---
+{failed_test_code}
+--- END FAILED TEST CLASS ---
+
+--- BEGIN MAIN CLASS UNDER TEST ---
+{main_code}
+--- END MAIN CLASS UNDER TEST ---
+
+You must generate a complete test class named {target_class_name}Test in package {target_package_name}, covering ONLY these methods:
+{method_list_str}
+"""
+                    elif i > 0:
+                        with open(test_output_file_path, 'r', encoding='utf-8') as f:
+                            current_test_code = f.read()
+                        prompt = f"""
+{good_example}
+{forbidden}
+--- ENDPOINTS UNDER TEST ---
+{endpoints_list_str}
+--- END ENDPOINTS ---
+You are an expert Java test developer. Here is the current test class for {target_class_name}:
+--- BEGIN EXISTING TEST CLASS ---
+{current_test_code}
+--- END EXISTING TEST CLASS ---
+
+Add new test methods for ONLY these methods:
+{method_list_str}
+
+--- BEGIN MAIN CLASS UNDER TEST ---
+{main_code}
+--- END MAIN CLASS UNDER TEST ---
+"""
+                        if i == 1 and retries == 0:
+                            pass  # Removed debug print of prompt
+                    # Safeguard: Remove any Dependency: blocks or lines from the prompt
+                    import re
+                    prompt = re.sub(r'^Dependency:.*$', '', prompt, flags=re.MULTILINE)
+                    prompt = re.sub(r'- public .*$', '', prompt, flags=re.MULTILINE)
+                    # Remove all signatures, parameter lists, and annotation lines from main class code for controllers
+                    # Remove any excessive blank lines
+                    prompt = re.sub(r'\n{3,}', '\n\n', prompt)
+                # Print the prompt only on retries (not on the first attempt)
+                if retries > 0:
+                    print(f"\n[RETRY {retries}] PROMPT SENT TO LLM:\n" + prompt + "\n[END RETRY PROMPT]\n")
+                result = self.llm.invoke(prompt)
+                if hasattr(result, "content"):
+                    result = result.content
+                code = result.strip()
+                code = re.sub(r'^```[a-zA-Z]*\n', '', code)
+                code = re.sub(r'^```', '', code)
+                code = re.sub(r'```$', '', code)
+                code = code.strip()
+                if i == 0:
+                    # First batch: write the full class
+                    test_output_file_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(test_output_file_path, 'w', encoding='utf-8') as f:
+                        f.write(code)
+                else:
+                    # For subsequent batches, overwrite the test file with the new full class
+                    with open(test_output_file_path, 'w', encoding='utf-8') as f:
+                        f.write(code)
+                # Run the test file
+                test_run_results = self.java_test_runner.run_test(test_output_file_path)
+                compilation_errors = test_run_results['detailed_errors'].get('compilation_errors', [])
+                test_failures = test_run_results['detailed_errors'].get('test_failures', [])
+                tests_run_zero = False
+                stdout = test_run_results.get('stdout', '')
+                test_summary_match = re.search(r"Tests run: (\d+), Failures: (\d+), Errors: (\d+), Skipped: (\d+)", stdout)
+                if test_summary_match:
+                    total = int(test_summary_match.group(1))
+                    if total == 0:
+                        tests_run_zero = True
+                        print("[WARNING] No tests were run (Tests run: 0). Treating as failure.")
+                if not compilation_errors and not test_failures and not tests_run_zero:
+                    print(f"[SUCCESS] Batch {i+1}/{len(batches)}: No compilation or test errors.")
+                    success = True
+                else:
+                    error_msgs = []
+                    if compilation_errors:
+                        print(f"[COMPILATION ERROR] Detected in batch {i+1}:")
+                        for err in compilation_errors:
+                            print(f"  - {err['message']} (at {err['location']})")
+                            error_msgs.append(f"COMPILATION: {err['message']} (at {err['location']})")
+                    if test_failures:
+                        print(f"[TEST FAILURE] Detected in batch {i+1}:")
+                        for err in test_failures:
+                            print(f"  - {err['message']} (in {err['location']})")
+                            error_msgs.append(f"TEST: {err['message']} (in {err['location']})")
+                    if tests_run_zero:
+                        error_msgs.append("NO TESTS RUN: The generated test class did not contain any executable tests. Ensure at least one @Test method is present and not ignored/skipped.")
+                    full_compilation_error = self.extract_full_compilation_error(stdout)
+                    print("\n[DEBUG] FULL COMPILATION ERROR BLOCK EXTRACTED (BATCH):\n" + (full_compilation_error or '[EMPTY]') + "\n[END DEBUG FULL COMPILATION ERROR BLOCK]\n")
+                    error_feedback = '\n'.join(error_msgs)
+                    if full_compilation_error:
+                        error_feedback += '\n\n--- FULL COMPILATION ERROR OUTPUT ---\n' + full_compilation_error + '\n--- END FULL COMPILATION ERROR OUTPUT ---\n'
+                    retries += 1
+            # Always update final_code with the latest test file after each batch
+            with open(test_output_file_path, 'r', encoding='utf-8') as f:
+                final_code = f.read()
+        # After all batches:
+        return final_code
+
     def extract_public_methods(self, class_code: str) -> set:
         """
-        Extracts all public method names from the given Java class code using regex.
-        Includes constructors and static methods. Handles annotations, generics, and line breaks.
+        Use javalang to robustly extract all public method names from the main class only.
         """
+        try:
+            tree = javalang.parse.parse(class_code)
+        except Exception as e:
+            print(f"[extract_public_methods] javalang parse error: {e}")
+            return set()
+        # Find the main class (the first class declaration)
+        main_class = None
+        for type_decl in tree.types:
+            if isinstance(type_decl, javalang.tree.ClassDeclaration):
+                main_class = type_decl
+                break
+        if not main_class:
+            print("[extract_public_methods] Could not find main class declaration.")
+            return set()
         methods = set()
-        
-        # Match public constructors (same name as class)
-        constructor_pattern = re.compile(r'public\s+(\w+)\s*\([^)]*\)\s*\{')
-        for match in constructor_pattern.finditer(class_code):
-            methods.add(match.group(1))
-        
-        # Improved pattern for Spring controller methods (handles @ResponseBody and other annotations)
-        method_pattern = re.compile(
-            r'public\s+'  # public modifier
-            r'(?:@[\w.]+\s*)*'  # Annotations after public (like @ResponseBody)
-            r'(?:[\w<>\[\],\s]+\s+)*'  # Return type
-            r'(\w+)\s*\(',  # Method name
-            re.MULTILINE
-        )
-        for match in method_pattern.finditer(class_code):
-            methods.add(match.group(1))
-        
-        # Match public static methods that might have different patterns
-        static_method_pattern = re.compile(r'public\s+static\s+(?:final\s+)?(?:<[^>]+>\s+)?[\w<>,\[\]]+\s+(\w+)\s*\(')
-        for match in static_method_pattern.finditer(class_code):
-            methods.add(match.group(1))
-        
-        print(f"[DEBUG] extract_public_methods found: {methods}")
+        for method in main_class.methods:
+            if 'public' in method.modifiers:
+                methods.add(method.name)
         return methods
 
     def extract_test_plan_methods(self, test_plan: list) -> set:
@@ -1076,7 +1294,7 @@ STRICT: You MUST use MockMvc, @WebMvcTest, @MockBean, and @Autowired MockMvc for
         from langchain_google_genai import ChatGoogleGenerativeAI
         import os
         GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-        llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.2)
+        llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.3)
         result = llm.invoke(prompt)
         if hasattr(result, "content"):
             result = result.content
@@ -1275,242 +1493,31 @@ STRICT: You MUST use MockMvc, @WebMvcTest, @MockBean, and @Autowired MockMvc for
             method_names.add(match.group(1))
         return method_names
 
-    def generate_test_case_in_batches(self,
-                                     target_class_name: str,
-                                     target_package_name: str,
-                                     custom_imports: List[str],
-                                     relevant_java_files_for_context: List[str],
-                                     test_output_file_path: Path,
-                                     additional_query_instructions: str,
-                                     requires_db_test: bool,
-                                     dependency_signatures: Dict[str, str] = None,
-                                     target_info: Dict[str, Any] = None) -> str:
+    def _get_full_code_from_chromadb(self, filename: str) -> str:
         """
-        Generate test cases for large classes in batches of 5 methods at a time.
-        For each batch, prompt the LLM to generate only the relevant test methods, append them to the test class file,
-        and after each batch, compile and run the tests. If not the first batch, include the current test class code as context.
+        Retrieve and concatenate all ChromaDB chunks for a given filename.
         """
-        # --- Early exit if test file already exists ---
-        if test_output_file_path.exists():
-            print(f"[SKIP] Test file already exists (inside generate_test_case_in_batches): '{test_output_file_path}'")
-            print(f"Skipping test generation for {target_class_name} (generate_test_case_in_batches)")
-            return ""
+        docs = self.vectorstore.similarity_search(f"Full code for {filename}", k=100, filter={"filename": filename})
+        # Sort by chunk index if available
+        try:
+            docs = sorted(docs, key=lambda d: d.metadata.get('chunk_index', 0))
+        except Exception:
+            pass
+        return '\n'.join([doc.page_content for doc in docs])
 
-        # Retrieve the full class code for the main class under test
-        main_class_filename = Path(target_info['java_file_path_abs']).name if target_info else None
-        dependency_filenames = [Path(f).name for f in relevant_java_files_for_context if Path(f).name != main_class_filename]
-        utility_filenames = [Path(f).name for f in relevant_java_files_for_context if Path(f).name not in dependency_filenames and Path(f).name != main_class_filename]
-        self._update_retriever_filter(main_class_filename, dependency_filenames, utility_filenames, k_override=5)
-        retrieved_docs = self.retriever.get_relevant_documents(f"Full code for {target_class_name}")
-        class_code = "\n\n".join([doc.page_content for doc in retrieved_docs if target_class_name in doc.page_content])
-        if not class_code:
-            class_code = "\n\n".join([doc.page_content for doc in retrieved_docs])
-        if not class_code:
-            class_code = "// ERROR: Could not retrieve main class code from ChromaDB."
-        print("\n[DEBUG] CLASS CODE SENT TO LLM (BATCH MODE):\n" + class_code + "\n[END DEBUG CLASS CODE]\n")
-
-        public_methods = list(self.extract_public_methods(class_code))
-        if not public_methods:
-            print("[ERROR] No public methods found for batch mode generation.")
-            return "// No public methods found to test."
-        batch_size = 5
-        batches = [public_methods[i:i+batch_size] for i in range(0, len(public_methods), batch_size)]
-        test_type = self._detect_test_type(target_info) if target_info else None
-        if test_type is None:
-            test_type = 'service'  # fallback
-
-        # For the first batch, get field declarations from the LLM
-        field_prompt = f"""
-You are an expert Java test developer. For the following class under test, generate ONLY the required field declarations (with @Mock, @InjectMocks, @MockBean, @Autowired, etc.) for a JUnit 5 + Mockito test class. Do NOT generate any test methods, imports, or class header. Output only the field declarations and their annotations.
-
---- BEGIN CLASS UNDER TEST ---
-{class_code}
---- END CLASS UNDER TEST ---
-"""
-        field_result = self.llm.invoke(field_prompt)
-        if hasattr(field_result, "content"):
-            field_result = field_result.content
-        field_section = self._extract_field_declarations(field_result)
-        # For controllers, always add MockMvc field if not present
-        if test_type == "controller" and "MockMvc" not in field_section:
-            field_section = "    @Autowired\n    private MockMvc mockMvc;\n" + field_section
-        # Track all field declarations present so far
-        all_fields_so_far = set([l.strip() for l in self._extract_field_declarations_list(field_result)])
-        if test_type == "controller" and "@Autowired" not in all_fields_so_far:
-            all_fields_so_far.add("@Autowired")
-            all_fields_so_far.add("private MockMvc mockMvc;")
-        # Use custom_imports as initial imports
-        imports_section = '\n'.join(custom_imports) if custom_imports else ''
-        # Ensure required imports for @ExtendWith(MockitoExtension.class) are present for service/repository
-        if test_type != "controller":
-            required_service_imports = [
-                'import org.junit.jupiter.api.extension.ExtendWith;',
-                'import org.mockito.junit.jupiter.MockitoExtension;'
-            ]
-            for imp in required_service_imports:
-                if imp not in imports_section:
-                    imports_section = imp + '\n' + imports_section
-        class_anno = "@WebMvcTest({}.class)".format(target_class_name) if test_type == "controller" else "@ExtendWith(MockitoExtension.class)"
-        test_class_code = f"package {target_package_name};\n{imports_section}\n\n{class_anno}\nclass {target_class_name}Test {{\n\n{field_section}\n"
-        test_output_file_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(test_output_file_path, 'w', encoding='utf-8') as f:
-            f.write(test_class_code)
-
-        for i, batch in enumerate(batches):
-            print(f"[BATCH MODE] Generating tests for methods: {batch}")
-            method_list_str = '\n'.join(f'- {m}' for m in batch)
-            # Build prompt
-            strict_controller_requirements = ""
-            if test_type == "controller":
-                strict_controller_requirements = f"""
-STRICT REQUIREMENTS for Controller Tests:
-- Use @WebMvcTest({target_class_name}.class) for the test class.
-- Use @Autowired MockMvc mockMvc; for HTTP request simulation.
-- Use @MockBean for all service/repository dependencies.
-- NEVER use @InjectMocks or @Mock for the controller or its dependencies.
-- All test methods must use mockMvc.perform(...) to simulate HTTP requests.
-- Do NOT instantiate the controller or call its methods directly.
-- Do NOT use Mockito to mock the controller itself.
-"""
-            prompt = f"""
-You are an expert Java test developer. ONLY generate tests for these methods (do NOT generate tests for any other methods):
-{method_list_str}
-{strict_controller_requirements}
---- BEGIN CLASS UNDER TEST ---
-{class_code}
---- END CLASS UNDER TEST ---
-"""
-            if i > 0:
-                # Add current test class code as context
-                with open(test_output_file_path, 'r', encoding='utf-8') as f:
-                    current_test_code = f.read()
-                prompt += f"\n--- BEGIN EXISTING TEST CLASS ---\n{current_test_code}\n--- END EXISTING TEST CLASS ---\n"
-            prompt += "\nOutput ONLY valid Java test methods for the above methods, to be inserted into the existing test class. Do not repeat class header, imports, or closing brace.\n" \
-                      "At the top of your output, ALWAYS include ALL necessary import statements (including static imports) for every class, static method, or utility used in your test methods. If you use assertEquals, verify, Arrays, etc., you MUST include their imports. Do not omit any required imports. Do not output explanations or markdown."
-            # LLM call
-            result = self.llm.invoke(prompt)
-            if hasattr(result, "content"):
-                result = result.content
-            code = result.strip()
-            code = re.sub(r'^```[a-zA-Z]*\n', '', code)
-            code = re.sub(r'^```', '', code)
-            code = re.sub(r'```$', '', code)
-            code = code.strip()
-            # Extract import statements from LLM output
-            batch_imports = self._extract_import_statements(code)
-            # Extract field declarations from LLM output for this batch
-            batch_fields = self._extract_field_declarations_list(code)
-            # Remove field declarations from code before inserting methods
-            code_wo_fields = '\n'.join([line for line in code.splitlines() if line.strip() not in batch_fields])
-            # Remove import statements from code before inserting methods
-            code_wo_imports = '\n'.join([line for line in code_wo_fields.splitlines() if not line.strip().startswith('import ')])
-            code_wo_imports = self._sanitize_llm_test_methods(code_wo_imports)
-            # Deduplicate test methods: only insert methods whose names are not already present
-            with open(test_output_file_path, 'r', encoding='utf-8') as f:
-                current_test_code = f.read()
-            existing_method_names = self._extract_test_method_names(current_test_code)
-            # Extract new test methods from this batch
-            new_methods = self.extract_all_test_methods(code_wo_imports)
-            deduped_methods = []
-            for m in new_methods:
-                # Extract method name
-                match = re.search(r'void\s+(\w+)\s*\(', m)
-                if match and match.group(1) not in existing_method_names:
-                    deduped_methods.append(m)
-                    existing_method_names.add(match.group(1))
-            # Insert deduped methods before closing brace
-            methods_to_insert = '\n\n'.join(deduped_methods)
-            # Insert methods before closing brace
-            last_brace = current_test_code.rstrip().rfind('}')
-            if last_brace == -1:
-                # Should not happen, fallback: append
-                new_test_code = current_test_code + "\n\n" + methods_to_insert + "\n\n}"
-            else:
-                new_test_code = current_test_code[:last_brace].rstrip() + "\n\n" + methods_to_insert + "\n\n}" + current_test_code[last_brace+1:]
-            with open(test_output_file_path, 'w', encoding='utf-8') as f:
-                f.write(new_test_code)
-            # Update import section with any new imports from this batch
-            self._update_imports_in_test_file(test_output_file_path, batch_imports, f"package {target_package_name};\n")
-            # Update field section with any new fields from this batch
-            new_fields = [f for f in batch_fields if f.strip() and f.strip() not in all_fields_so_far]
-            if new_fields:
-                self._update_fields_in_test_file(test_output_file_path, new_fields)
-                all_fields_so_far.update([f.strip() for f in new_fields])
-            # Compile and run tests
-            test_run_results = self.java_test_runner.run_test(test_output_file_path)
-            compilation_errors = test_run_results['detailed_errors'].get('compilation_errors', [])
-            test_failures = test_run_results['detailed_errors'].get('test_failures', [])
-            tests_run_zero = False
-            stdout = test_run_results.get('stdout', '')
-            test_summary_match = re.search(r"Tests run: (\d+), Failures: (\d+), Errors: (\d+), Skipped: (\d+)", stdout)
-            if test_summary_match:
-                total = int(test_summary_match.group(1))
-                if total == 0:
-                    tests_run_zero = True
-                    print("[WARNING] No tests were run (Tests run: 0). Treating as failure.")
-            if not compilation_errors and not test_failures and not tests_run_zero:
-                print(f"[SUCCESS] Batch {i+1}/{len(batches)}: No compilation or test errors.")
-            else:
-                error_msgs = []
-                if compilation_errors:
-                    print(f"[COMPILATION ERROR] Detected in batch {i+1}:")
-                    for err in compilation_errors:
-                        print(f"  - {err['message']} (at {err['location']})")
-                        error_msgs.append(f"COMPILATION: {err['message']} (at {err['location']})")
-                if test_failures:
-                    print(f"[TEST FAILURE] Detected in batch {i+1}:")
-                    for err in test_failures:
-                        print(f"  - {err['message']} (in {err['location']})")
-                        error_msgs.append(f"TEST: {err['message']} (in {err['location']})")
-                if tests_run_zero:
-                    error_msgs.append("NO TESTS RUN: The generated test class did not contain any executable tests. Ensure at least one @Test method is present and not ignored/skipped.")
-                # Extract full compilation error block from stdout (improved, like non-batch)
-                full_compilation_error = self.extract_full_compilation_error(stdout)
-                print("\n[DEBUG] FULL COMPILATION ERROR BLOCK EXTRACTED (BATCH):\n" + (full_compilation_error or '[EMPTY]') + "\n[END DEBUG FULL COMPILATION ERROR BLOCK]\n")
-                feedback = '\n'.join(error_msgs)
-                if full_compilation_error:
-                    feedback += '\n\n--- FULL COMPILATION ERROR OUTPUT ---\n' + full_compilation_error + '\n--- END FULL COMPILATION ERROR OUTPUT ---\n'
-                retry_prompt = prompt + f"\n--- ERROR FEEDBACK FROM PREVIOUS ATTEMPT ---\n{feedback}\n--- END ERROR FEEDBACK ---\n"
-                retry_result = self.llm.invoke(retry_prompt)
-                if hasattr(retry_result, "content"):
-                    retry_result = retry_result.content
-                retry_code = retry_result.strip()
-                retry_code = re.sub(r'^```[a-zA-Z]*\n', '', retry_code)
-                retry_code = re.sub(r'^```', '', retry_code)
-                retry_code = re.sub(r'```$', '', retry_code)
-                retry_code = retry_code.strip()
-                retry_batch_fields = self._extract_field_declarations_list(retry_code)
-                retry_code_wo_fields = '\n'.join([line for line in retry_code.splitlines() if line.strip() not in retry_batch_fields])
-                retry_code_wo_imports = '\n'.join([line for line in retry_code_wo_fields.splitlines() if not line.strip().startswith('import ')])
-                retry_code_wo_imports = self._sanitize_llm_test_methods(retry_code_wo_imports)
-                # Update field section with any new fields from retry
-                retry_new_fields = [f for f in retry_batch_fields if f.strip() and f.strip() not in all_fields_so_far]
-                if retry_new_fields:
-                    self._update_fields_in_test_file(test_output_file_path, retry_new_fields)
-                    all_fields_so_far.update([f.strip() for f in retry_new_fields])
-                with open(test_output_file_path, 'r', encoding='utf-8') as f:
-                    current_test_code = f.read()
-                last_brace = current_test_code.rstrip().rfind('}')
-                if last_brace == -1:
-                    new_test_code = current_test_code + "\n\n" + retry_code_wo_imports + "\n\n}"
-                else:
-                    new_test_code = current_test_code[:last_brace].rstrip() + "\n\n" + retry_code_wo_imports + "\n\n}" + current_test_code[last_brace+1:]
-                with open(test_output_file_path, 'w', encoding='utf-8') as f:
-                    f.write(new_test_code)
-                # Extract imports from retry output
-                retry_batch_imports = self._extract_import_statements(retry_code)
-                # Update import section with any new imports from retry
-                self._update_imports_in_test_file(test_output_file_path, retry_batch_imports, f"package {target_package_name};\n")
-                # Re-run tests
-                test_run_results = self.java_test_runner.run_test(test_output_file_path)
-                if not test_run_results['detailed_errors'].get('compilation_errors', []) and not test_run_results['detailed_errors'].get('test_failures', []):
-                    print(f"[SUCCESS] Batch {i+1}/{len(batches)}: Passed after retry.")
-                else:
-                    print(f"[ERROR] Batch {i+1}/{len(batches)}: Still failing after retry. See logs.")
-        print(f"[FINAL SUCCESS] Batch mode test case saved to: '{test_output_file_path}'")
-        with open(test_output_file_path, 'r', encoding='utf-8') as f:
-            final_code = f.read()
-        return final_code
+    def _build_full_context_from_chromadb(self, main_class_filename: str, dependency_filenames: list) -> str:
+        """
+        Build the full prompt context: main class code and all dependencies, from ChromaDB.
+        """
+        context = f"--- BEGIN MAIN CLASS UNDER TEST ---\n"
+        main_code = self._get_full_code_from_chromadb(main_class_filename)
+        context += main_code + "\n--- END MAIN CLASS UNDER TEST ---\n\n"
+        for dep in dependency_filenames:
+            if dep == main_class_filename:
+                continue
+            dep_code = self._get_full_code_from_chromadb(dep)
+            context += f"--- BEGIN DEPENDENCY: {dep} ---\n{dep_code}\n--- END DEPENDENCY: {dep} ---\n\n"
+        return context
 
     def extract_full_compilation_error(self, stdout: str) -> str:
         """
@@ -1543,6 +1550,195 @@ You are an expert Java test developer. ONLY generate tests for these methods (do
                         error_block.append(lines[i+2])
                 i += 1
         return '\n'.join(error_block) if error_block else stdout
+
+# --- Helper: Extract class signatures (public/protected methods, fields, constructors) ---
+def extract_class_signatures(java_code: str) -> str:
+    """
+    Given full Java class code, return a string with only the class declaration and public/protected method/field/constructor signatures.
+    """
+    try:
+        tree = javalang.parse.parse(java_code)
+    except Exception as e:
+        print(f"[extract_class_signatures] javalang parse error: {e}")
+        return java_code  # fallback: return original code
+    output = []
+    for type_decl in tree.types:
+        if isinstance(type_decl, javalang.tree.ClassDeclaration):
+            class_decl = f"public class {type_decl.name}"
+            if type_decl.extends:
+                class_decl += f" extends {type_decl.extends.name}"
+            if type_decl.implements:
+                impls = ', '.join(i.name for i in type_decl.implements)
+                class_decl += f" implements {impls}"
+            class_decl += " {"
+            output.append(class_decl)
+            # Fields
+            for field in type_decl.fields:
+                mods = ' '.join(sorted(field.modifiers & {'public', 'protected'}))
+                if not mods:
+                    continue
+                decl = f"    {mods} {field.type.name if hasattr(field.type, 'name') else str(field.type)}"
+                decl += ' ' + ', '.join(d.name for d in field.declarators) + ';'
+                output.append(decl)
+            # Constructors
+            for ctor in type_decl.constructors:
+                mods = ' '.join(sorted(ctor.modifiers & {'public', 'protected'}))
+                if not mods:
+                    continue
+                params = ', '.join(
+                    (p.type.name if hasattr(p.type, 'name') else str(p.type)) + ("[]" if p.type.dimensions else "") + " " + p.name
+                    for p in ctor.parameters
+                )
+                output.append(f"    {mods} {ctor.name}({params});")
+            # Methods
+            for method in type_decl.methods:
+                mods = ' '.join(sorted(method.modifiers & {'public', 'protected'}))
+                if not mods:
+                    continue
+                params = ', '.join(
+                    (p.type.name if hasattr(p.type, 'name') else str(p.type)) + ("[]" if p.type.dimensions else "") + " " + p.name
+                    for p in method.parameters
+                )
+                ret_type = method.return_type.name if method.return_type and hasattr(method.return_type, 'name') else (str(method.return_type) if method.return_type else 'void')
+                output.append(f"    {mods} {ret_type} {method.name}({params});")
+            output.append("}")
+            break  # Only first class
+    return '\n'.join(output) if output else java_code
+
+def extract_minimal_class_for_methods(java_code: str, method_names: list) -> str:
+    """
+    Given full Java class code and a list of method names, return a minimal class code string containing:
+    - The class declaration and all class-level annotations
+    - All fields
+    - The specified methods (with annotations, signatures, and bodies)
+    - Any private/helper methods directly called by the batch methods (recursively)
+    """
+    import re
+    try:
+        tree = javalang.parse.parse(java_code)
+    except Exception as e:
+        print(f"[extract_minimal_class_for_methods] javalang parse error: {e}")
+        # Fallback: extract class header and all fields, and only the batch methods by regex
+        class_header = re.search(r'((@[\w\(\)\"\., =/]+\s*)*public class [\w<>]+[^{]*\{)', java_code)
+        header = class_header.group(1) if class_header else 'public class Dummy {'
+        # Extract all fields (lines ending with ';' before any method)
+        field_lines = []
+        for line in java_code.splitlines():
+            if re.match(r'\s*(public|private|protected)?\s*[\w<>\[\]]+\s+[\w, ]+;', line):
+                field_lines.append(line)
+        # Extract methods by name
+        method_blocks = []
+        for m in method_names:
+            pat = re.compile(r'(\s*@[\w\(\)\"\., =/]+\s*)*(public|private|protected)?[\s\w<>\[\],]*\s+' + re.escape(m) + r'\s*\([^)]*\)\s*\{[\s\S]*?^\}', re.MULTILINE)
+            match = pat.search(java_code)
+            if match:
+                method_blocks.append(match.group(0))
+        result = header + '\n' + '\n'.join(field_lines) + '\n' + '\n'.join(method_blocks) + '\n}'
+        print("[extract_minimal_class_for_methods] Fallback minimal class used.")
+        return result
+    # Find the main class
+    main_class = None
+    for type_decl in tree.types:
+        if isinstance(type_decl, javalang.tree.ClassDeclaration):
+            main_class = type_decl
+            break
+    if not main_class:
+        print("[extract_minimal_class_for_methods] Could not find main class declaration.")
+        return 'public class Dummy {}'
+    # Collect class-level annotations
+    class_annos = []
+    if hasattr(main_class, 'annotations') and main_class.annotations:
+        for anno in main_class.annotations:
+            # Try to extract annotation line from code
+            if hasattr(anno, 'position') and anno.position:
+                start = anno.position[0] - 1
+                end = anno.position[0]
+                class_annos.append(java_code.splitlines()[start])
+            else:
+                class_annos.append(f"@{anno.name}")
+    # Class declaration line
+    class_decl_line = None
+    for i, line in enumerate(java_code.splitlines()):
+        if re.match(r'.*class\s+' + re.escape(main_class.name) + r'\b', line):
+            class_decl_line = line
+            break
+    if not class_decl_line:
+        class_decl_line = f"public class {main_class.name} {{"
+    # Collect all fields (by line numbers)
+    field_lines = []
+    for field in main_class.fields:
+        if hasattr(field, 'position') and field.position:
+            start = field.position[0] - 1
+            end = field.position[1] if hasattr(field, 'position') and field.position and len(field.position) > 1 else start + 1
+            field_lines.extend(java_code.splitlines()[start:end])
+        else:
+            mods = ' '.join(field.modifiers)
+            typ = field.type.name if hasattr(field.type, 'name') else str(field.type)
+            decl = f"    {mods} {typ} " + ', '.join(d.name for d in field.declarators) + ';'
+            field_lines.append(decl)
+    # Map method name to method node
+    method_map = {m.name: m for m in main_class.methods}
+    # Helper: get method source by line numbers
+    def get_method_src(method):
+        if hasattr(method, 'position') and method.position:
+            start = method.position[0] - 1
+            # Try to find the end of the method by matching braces
+            lines = java_code.splitlines()[start:]
+            brace_count = 0
+            method_lines = []
+            started = False
+            for l in lines:
+                if '{' in l:
+                    brace_count += l.count('{')
+                    started = True
+                if '}' in l:
+                    brace_count -= l.count('}')
+                method_lines.append(l)
+                if started and brace_count == 0:
+                    break
+            return '\n'.join(method_lines)
+        # fallback: reconstruct signature and body
+        mods = ' '.join(method.modifiers)
+        ret_type = method.return_type.name if method.return_type and hasattr(method.return_type, 'name') else (str(method.return_type) if method.return_type else 'void')
+        params = ', '.join(
+            (p.type.name if hasattr(p.type, 'name') else str(p.type)) + ("[]" if p.type.dimensions else "") + " " + p.name
+            for p in method.parameters
+        )
+        header = f"    {mods} {ret_type} {method.name}({params}) "
+        return header + "{ ... }"
+    # Find all methods to include: batch + directly called helpers (recursively)
+    to_include = set(method_names)
+    included = set()
+    def add_called_helpers(method):
+        if method.name in included:
+            return
+        included.add(method.name)
+        # Find all method invocations in the method body
+        if hasattr(method, 'body') and method.body:
+            for path, node in method:
+                if isinstance(node, javalang.tree.MethodInvocation):
+                    if node.member in method_map and node.member not in to_include:
+                        to_include.add(node.member)
+                        add_called_helpers(method_map[node.member])
+    for m in method_names:
+        if m in method_map:
+            add_called_helpers(method_map[m])
+    # Collect method sources
+    method_lines = []
+    for m in main_class.methods:
+        if m.name in to_include:
+            method_lines.append(get_method_src(m))
+    # Assemble minimal class
+    result = ''
+    if class_annos:
+        result += '\n'.join(class_annos) + '\n'
+    result += class_decl_line + '\n'
+    for f in field_lines:
+        result += f + '\n'
+    for m in method_lines:
+        result += m + '\n'
+    result += '}'
+    return result
 
 if __name__ == "__main__":
     try:
@@ -1609,6 +1805,16 @@ if __name__ == "__main__":
                 public_methods_for_batch = list(test_generator.extract_public_methods(class_code_for_batch))
             except Exception as e:
                 print(f"[WARNING] Could not extract public methods for batch mode decision: {e}")
+            # --- NEW: Always print method count and mode ---
+            if public_methods_for_batch is not None:
+                print(f"[DEBUG] Found {len(public_methods_for_batch)} public methods for {target_class_name}")
+                print(f"[DEBUG] Extracted public methods: {public_methods_for_batch}")
+                if len(public_methods_for_batch) > 8:
+                    print(f"[DEBUG] Using batch mode for test generation.")
+                else:
+                    print(f"[DEBUG] Using single-shot mode for test generation.")
+            else:
+                print(f"[DEBUG] Could not determine public method count for {target_class_name}")
             if public_methods_for_batch and len(public_methods_for_batch) > 8:
                 generated_test_code = test_generator.generate_test_case_in_batches(
                     target_class_name=target_class_name,
