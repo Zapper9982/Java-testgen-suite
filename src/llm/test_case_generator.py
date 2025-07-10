@@ -184,7 +184,7 @@ class TestCaseGenerator:
             raise ValueError("GOOGLE_API_KEY environment variable is not set. Cannot initialize Gemini LLM.")
         
         print(f"Using Google Gemini LLM: {LLM_MODEL_NAME_GEMINI}...")
-        return ChatGoogleGenerativeAI(model=LLM_MODEL_NAME_GEMINI, temperature=0.1)
+        return ChatGoogleGenerativeAI(model=LLM_MODEL_NAME_GEMINI, temperature=0.2)
 
     def _update_retriever_filter(self, main_class_filename: str, dependency_filenames: List[str], utility_filenames: List[str] = None, k_override: int = None):
         """
@@ -782,8 +782,32 @@ Instructions:
             retries = 0  # Always define retries at the start of the batch
             success = False
             error_feedback = None
+            # --- NEW: Use minimal class code for batch ---
+            with open(target_info['java_file_path_abs'], 'r', encoding='utf-8') as f:
+                main_code = f.read()
+            # Extract import statements
+            import_lines = [line for line in main_code.splitlines() if line.strip().startswith('import ')]
+            imports_section = ''
+            if import_lines:
+                imports_section = '--- BEGIN IMPORTS ---\n' + '\n'.join(import_lines) + '\n--- END IMPORTS ---\n\n'
+            minimal_class_code = extract_minimal_class_for_methods(main_code, batch)
+            # --- NEW: For dependencies, only include used signatures ---
+            dep_signatures = []
+            for dep in all_deps:
+                if dep == main_class_filename:
+                    continue
+                dep_code = self._get_full_code_from_chromadb(dep)
+                dep_sign = extract_class_signatures(dep_code)
+                dep_signatures.append(f"--- BEGIN DEPENDENCY SIGNATURES: {dep} ---\n{dep_sign}\n--- END DEPENDENCY SIGNATURES: {dep} ---\n")
+            # Build the minimal context
+            minimal_context = imports_section
+            minimal_context += f"--- BEGIN MAIN CLASS UNDER TEST (MINIMAL) ---\n{minimal_class_code}\n--- END MAIN CLASS UNDER TEST (MINIMAL) ---\n\n"
+            minimal_context += "\n".join(dep_signatures)
+            # Add strictness for no comments
+            strict_no_comments = '\nSTRICT: Do NOT add any comments to the generated code.\n'
+            minimal_context += strict_no_comments
             while retries < 15 and not success:
-                context = full_context  # Always use full context for every batch
+                context = minimal_context  # Use minimal context for every batch
                 if test_type == "controller":
                     good_example = '''
 // GOOD EXAMPLE (DO THIS):
@@ -831,34 +855,49 @@ STRICT REQUIREMENTS:
 --- ENDPOINTS UNDER TEST ---
 {endpoints_list_str}
 --- END ENDPOINTS ---
---- BEGIN MAIN CLASS UNDER TEST ---
-{main_code}
---- END MAIN CLASS UNDER TEST ---
-
+{context}
 You must generate a complete test class named {target_class_name}Test in package {target_package_name}, covering ONLY these methods:
 {method_list_str}
 """
-                    elif i == 0 and retries > 0:
+                    elif retries > 0:
+                        # --- NEW: Structured error feedback prompt ---
                         with open(test_output_file_path, 'r', encoding='utf-8') as f:
                             failed_test_code = f.read()
+                        # Parse error_feedback for summary
+                        error_summary = ""
+                        if error_feedback:
+                            # Try to extract type, method, message, location from error_feedback
+                            lines = error_feedback.split('\n')
+                            for line in lines:
+                                if line.startswith("COMPILATION:"):
+                                    error_summary += f"Type: COMPILATION ERROR\nMessage: {line[12:].strip()}\n"
+                                elif line.startswith("TEST:"):
+                                    # Try to extract method and message
+                                    msg = line[5:].strip()
+                                    m = re.match(r"(.+?) \\(in (.+?)\\)", msg)
+                                    if m:
+                                        error_summary += f"Type: TEST FAILURE\nTest Method: {m.group(2)}\nMessage: {m.group(1)}\n"
+                                    else:
+                                        error_summary += f"Type: TEST FAILURE\nMessage: {msg}\n"
+                                elif line.startswith("NO TESTS RUN"):
+                                    error_summary += f"Type: NO TESTS RUN\nMessage: {line.strip()}\n"
+                        if not error_summary:
+                            error_summary = error_feedback or "Unknown error."
                         prompt = f"""
-{good_example}
-{forbidden}
---- ENDPOINTS UNDER TEST ---
-{endpoints_list_str}
---- END ENDPOINTS ---
-The previous output failed to compile/run with the following errors:
-{error_feedback}
+--- ERROR SUMMARY ---
+{error_summary}
 
-Here is the test class that failed:
---- BEGIN FAILED TEST CLASS ---
+--- INSTRUCTIONS ---
+- Fix ONLY the error(s) shown above.
+- Do NOT change unrelated methods or code.
+- Ensure the test class compiles and all tests pass.
+- If you are unsure about a dependency or method, add a TODO comment.
+
+--- FAILED TEST CLASS ---
 {failed_test_code}
 --- END FAILED TEST CLASS ---
 
---- BEGIN MAIN CLASS UNDER TEST ---
-{main_code}
---- END MAIN CLASS UNDER TEST ---
-
+{context}
 You must generate a complete test class named {target_class_name}Test in package {target_package_name}, covering ONLY these methods:
 {method_list_str}
 """
@@ -879,9 +918,7 @@ You are an expert Java test developer. Here is the current test class for {targe
 Add new test methods for ONLY these methods:
 {method_list_str}
 
---- BEGIN MAIN CLASS UNDER TEST ---
-{main_code}
---- END MAIN CLASS UNDER TEST ---
+{context}
 """
                         if i == 1 and retries == 0:
                             pass  # Removed debug print of prompt
@@ -892,9 +929,8 @@ Add new test methods for ONLY these methods:
                     # Remove all signatures, parameter lists, and annotation lines from main class code for controllers
                     # Remove any excessive blank lines
                     prompt = re.sub(r'\n{3,}', '\n\n', prompt)
-                # Print the prompt only on retries (not on the first attempt)
-                if retries > 0:
-                    print(f"\n[RETRY {retries}] PROMPT SENT TO LLM:\n" + prompt + "\n[END RETRY PROMPT]\n")
+                # Print the prompt for every batch attempt
+                print(f"\n[BATCH {i+1} RETRY {retries}] PROMPT SENT TO LLM:\n" + prompt + "\n[END PROMPT]\n")
                 result = self.llm.invoke(prompt)
                 if hasattr(result, "content"):
                     result = result.content
@@ -1294,7 +1330,7 @@ STRICT: You MUST use MockMvc, @WebMvcTest, @MockBean, and @Autowired MockMvc for
         from langchain_google_genai import ChatGoogleGenerativeAI
         import os
         GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-        llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.3)
+        llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.1)
         result = llm.invoke(prompt)
         if hasattr(result, "content"):
             result = result.content
@@ -1612,6 +1648,7 @@ def extract_minimal_class_for_methods(java_code: str, method_names: list) -> str
     - All fields
     - The specified methods (with annotations, signatures, and bodies)
     - Any private/helper methods directly called by the batch methods (recursively)
+    - PATCH: For each method, include all method-level annotations (lines starting with '@' immediately above the method signature)
     """
     import re
     try:
@@ -1619,22 +1656,23 @@ def extract_minimal_class_for_methods(java_code: str, method_names: list) -> str
     except Exception as e:
         print(f"[extract_minimal_class_for_methods] javalang parse error: {e}")
         # Fallback: extract class header and all fields, and only the batch methods by regex
-        class_header = re.search(r'((@[\w\(\)\"\., =/]+\s*)*public class [\w<>]+[^{]*\{)', java_code)
+        class_header = re.search(r'((@[^\n]+\n)*public class [\w<>]+[^{]*\{)', java_code)
         header = class_header.group(1) if class_header else 'public class Dummy {'
         # Extract all fields (lines ending with ';' before any method)
         field_lines = []
         for line in java_code.splitlines():
-            if re.match(r'\s*(public|private|protected)?\s*[\w<>\[\]]+\s+[\w, ]+;', line):
+            if re.match(r'\s*(public|private|protected)?\s*[\w<\>\[\]]+\s+[\w, ]+;', line):
                 field_lines.append(line)
-        # Extract methods by name
+        # Extract methods by name, including annotations
         method_blocks = []
         for m in method_names:
-            pat = re.compile(r'(\s*@[\w\(\)\"\., =/]+\s*)*(public|private|protected)?[\s\w<>\[\],]*\s+' + re.escape(m) + r'\s*\([^)]*\)\s*\{[\s\S]*?^\}', re.MULTILINE)
+            # Find the method signature
+            pat = re.compile(r'(\s*@[^\n]+\n)*\s*(public|private|protected)?[\s\w<>,\[\]]*\s+' + re.escape(m) + r'\s*\([^)]*\)\s*\{[\s\S]*?^\}', re.MULTILINE)
             match = pat.search(java_code)
             if match:
                 method_blocks.append(match.group(0))
         result = header + '\n' + '\n'.join(field_lines) + '\n' + '\n'.join(method_blocks) + '\n}'
-        print("[extract_minimal_class_for_methods] Fallback minimal class used.")
+        print("[extract_minimal_class_for_methods] Fallback minimal class used (with method annotations).")
         return result
     # Find the main class
     main_class = None
@@ -1678,16 +1716,22 @@ def extract_minimal_class_for_methods(java_code: str, method_names: list) -> str
             field_lines.append(decl)
     # Map method name to method node
     method_map = {m.name: m for m in main_class.methods}
-    # Helper: get method source by line numbers
-    def get_method_src(method):
+    # Helper: get method source by line numbers, including annotations
+    def get_method_src_with_annotations(method):
         if hasattr(method, 'position') and method.position:
             start = method.position[0] - 1
-            # Try to find the end of the method by matching braces
-            lines = java_code.splitlines()[start:]
+            # Look upwards for annotations
+            lines = java_code.splitlines()
+            anno_lines = []
+            idx = start - 1
+            while idx >= 0 and lines[idx].strip().startswith('@'):
+                anno_lines.insert(0, lines[idx])
+                idx -= 1
+            # Now, get the method body as before
             brace_count = 0
             method_lines = []
             started = False
-            for l in lines:
+            for l in lines[start:]:
                 if '{' in l:
                     brace_count += l.count('{')
                     started = True
@@ -1696,7 +1740,7 @@ def extract_minimal_class_for_methods(java_code: str, method_names: list) -> str
                 method_lines.append(l)
                 if started and brace_count == 0:
                     break
-            return '\n'.join(method_lines)
+            return '\n'.join(anno_lines + method_lines)
         # fallback: reconstruct signature and body
         mods = ' '.join(method.modifiers)
         ret_type = method.return_type.name if method.return_type and hasattr(method.return_type, 'name') else (str(method.return_type) if method.return_type else 'void')
@@ -1723,11 +1767,11 @@ def extract_minimal_class_for_methods(java_code: str, method_names: list) -> str
     for m in method_names:
         if m in method_map:
             add_called_helpers(method_map[m])
-    # Collect method sources
+    # Collect method sources (with annotations)
     method_lines = []
     for m in main_class.methods:
         if m.name in to_include:
-            method_lines.append(get_method_src(m))
+            method_lines.append(get_method_src_with_annotations(m))
     # Assemble minimal class
     result = ''
     if class_annos:
