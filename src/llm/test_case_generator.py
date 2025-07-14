@@ -813,8 +813,10 @@ Instructions:
             while retries < 15 and not success:
                 context = minimal_context  # Use minimal context for every batch
                 if test_type == "controller":
+                    # Strict standalone MockMvc + Mockito enforcement for controllers
                     good_example = '''
-// GOOD EXAMPLE (DO THIS):
+package com.iemr.common.controller.door_to_door_app;
+
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -825,37 +827,56 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
+import static org.mockito.Mockito.when;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.any;
+import static org.hamcrest.Matchers.is;
+import static org.hamcrest.Matchers.containsString;
+
 @ExtendWith(MockitoExtension.class)
-class MyControllerTest {
+class DoorToDoorAppControllerTest {
     private MockMvc mockMvc;
-    @Mock MyService myService;
-    @InjectMocks MyController controller;
+
+    @Mock
+    DoorToDoorService doorToDoorService;
+
+    @InjectMocks
+    DoorToDoorAppController doorToDoorAppController;
 
     @BeforeEach
     void setUp() {
         MockitoAnnotations.openMocks(this);
-        mockMvc = MockMvcBuilders.standaloneSetup(controller).build();
+        mockMvc = MockMvcBuilders.standaloneSetup(doorToDoorAppController).build();
     }
 
-    @Test
-    void shouldDoSomething() throws Exception {
-        // test logic using mockMvc
-    }
+    // ... test methods ...
 }
 '''
-                    forbidden = """
+                    strict_requirements = """
 STRICT REQUIREMENTS:
-- You MUST use standalone MockMvc with Mockito: @ExtendWith(MockitoExtension.class), @InjectMocks for the controller, @Mock for dependencies, and initialize MockMvc in @BeforeEach using MockMvcBuilders.standaloneSetup(controller).
+- You MUST use standalone MockMvc with Mockito: use @ExtendWith(MockitoExtension.class), @InjectMocks for the controller, @Mock for dependencies, and initialize MockMvc in @BeforeEach using MockMvcBuilders.standaloneSetup(controller).
 - Do NOT use @WebMvcTest, @MockBean, @Autowired, or @SpringBootTest for controllers.
 - Do NOT use field injection for MockMvc or dependencies.
 - Do NOT generate any code for dependencies. Only generate the test class for the controller. Assume all dependencies exist and are available for mocking.
 - If you use any forbidden annotation or pattern, you will be penalized and re-prompted.
 - Output ONLY compilable Java code, no explanations or markdown.
+- The test class must look like this example (structure, annotations, and setup):
+
+--- GOOD EXAMPLE (DO THIS) ---
+{good_example}
+--- END EXAMPLE ---
+
+- All test methods must use mockMvc to perform HTTP requests and assert responses.
+- Do NOT use any forbidden annotations or Spring Boot test context.
+- Do NOT add comments or explanations to the code.
 """
                     dependencies_context = ''  # No dependencies for controllers in batch mode
                     if i == 0 and retries == 0:
-                        prompt = f"""{good_example}
-{forbidden}
+                        prompt = f"""{strict_requirements}
 --- ENDPOINTS UNDER TEST ---
 {endpoints_list_str}
 --- END ENDPOINTS ---
@@ -864,19 +885,15 @@ You must generate a complete test class named {target_class_name}Test in package
 {method_list_str}
 """
                     elif retries > 0:
-                        # --- NEW: Structured error feedback prompt ---
                         with open(test_output_file_path, 'r', encoding='utf-8') as f:
                             failed_test_code = f.read()
-                        # Parse error_feedback for summary
                         error_summary = ""
                         if error_feedback:
-                            # Try to extract type, method, message, location from error_feedback
                             lines = error_feedback.split('\n')
                             for line in lines:
                                 if line.startswith("COMPILATION:"):
                                     error_summary += f"Type: COMPILATION ERROR\nMessage: {line[12:].strip()}\n"
                                 elif line.startswith("TEST:"):
-                                    # Try to extract method and message
                                     msg = line[5:].strip()
                                     m = re.match(r"(.+?) \\(in (.+?)\\)", msg)
                                     if m:
@@ -888,6 +905,7 @@ You must generate a complete test class named {target_class_name}Test in package
                         if not error_summary:
                             error_summary = error_feedback or "Unknown error."
                         prompt = f"""
+{strict_requirements}
 --- ERROR SUMMARY ---
 {error_summary}
 
@@ -909,8 +927,7 @@ You must generate a complete test class named {target_class_name}Test in package
                         with open(test_output_file_path, 'r', encoding='utf-8') as f:
                             current_test_code = f.read()
                         prompt = f"""
-{good_example}
-{forbidden}
+{strict_requirements}
 --- ENDPOINTS UNDER TEST ---
 {endpoints_list_str}
 --- END ENDPOINTS ---
@@ -936,8 +953,6 @@ STRICT INSTRUCTIONS:
                     import re
                     prompt = re.sub(r'^Dependency:.*$', '', prompt, flags=re.MULTILINE)
                     prompt = re.sub(r'- public .*$', '', prompt, flags=re.MULTILINE)
-                    # Remove all signatures, parameter lists, and annotation lines from main class code for controllers
-                    # Remove any excessive blank lines
                     prompt = re.sub(r'\n{3,}', '\n\n', prompt)
                 # Print the prompt for every batch attempt
                 print(f"\n[BATCH {i+1} RETRY {retries}] PROMPT SENT TO LLM:\n" + prompt + "\n[END PROMPT]\n")
@@ -1244,12 +1259,19 @@ STRICT INSTRUCTIONS:
         
         method_list = "\n".join(f"- {method}" for method in sorted(public_methods))
         
+        # Use minimal class code for all public methods
+        try:
+            minimal_class_code = extract_minimal_class_for_methods(class_code, list(public_methods))
+        except Exception as e:
+            print(f"[ERROR] Failed to extract minimal class code: {e}")
+            minimal_class_code = class_code  # fallback
+        
         # Simplified, focused prompt
         prompt = f"""
 You are an expert Java test developer. Generate a complete JUnit 5 + Mockito test class for the following Java class.
 
 CLASS UNDER TEST:
-{class_code}
+{minimal_class_code}
 
 REQUIREMENTS:
 - Test class name: {target_class_name}Test
@@ -1875,49 +1897,18 @@ if __name__ == "__main__":
             print(f"DATABASE MOCKING REQUIRED: {requires_db_test}")
             print(f"EXPECTED TEST OUTPUT PATH: '{test_output_file_path}'")
             print("="*80)
-            # --- Generate the test case with feedback loop ---
-            # Use batch mode for large classes
-            public_methods_for_batch = None
-            try:
-                with open(java_file_path_abs, 'r', encoding='utf-8') as f:
-                    class_code_for_batch = f.read()
-                public_methods_for_batch = list(test_generator.extract_public_methods(class_code_for_batch))
-            except Exception as e:
-                print(f"[WARNING] Could not extract public methods for batch mode decision: {e}")
-            # --- NEW: Always print method count and mode ---
-            if public_methods_for_batch is not None:
-                print(f"[DEBUG] Found {len(public_methods_for_batch)} public methods for {target_class_name}")
-                print(f"[DEBUG] Extracted public methods: {public_methods_for_batch}")
-                if len(public_methods_for_batch) > 8:
-                    print(f"[DEBUG] Using batch mode for test generation.")
-                else:
-                    print(f"[DEBUG] Using single-shot mode for test generation.")
-            else:
-                print(f"[DEBUG] Could not determine public method count for {target_class_name}")
-            if public_methods_for_batch and len(public_methods_for_batch) > 8:
-                generated_test_code = test_generator.generate_test_case_in_batches(
-                    target_class_name=target_class_name,
-                    target_package_name=target_package_name,
-                    custom_imports=custom_imports_list,
-                    relevant_java_files_for_context=relevant_java_files_for_context,
-                    test_output_file_path=test_output_file_path,
-                    additional_query_instructions="and make sure there are no errors, and you don't cause mismatch in return types and stuff.",
-                    requires_db_test=requires_db_test,
-                    dependency_signatures=None,
-                    target_info=target_info
-                )
-            else:
-                generated_test_code = test_generator.generate_test_case(
-                    target_class_name=target_class_name,
-                    target_package_name=target_package_name,
-                    custom_imports=custom_imports_list,
-                    relevant_java_files_for_context=relevant_java_files_for_context,
-                    test_output_file_path=test_output_file_path,
-                    additional_query_instructions="and make sure there are no errors, and you don't cause mismatch in return types and stuff.",
-                    requires_db_test=requires_db_test,
-                    dependency_signatures=None,
-                    target_info=target_info
-                )
+            # --- Always use batch mode for test generation ---
+            generated_test_code = test_generator.generate_test_case_in_batches(
+                target_class_name=target_class_name,
+                target_package_name=target_package_name,
+                custom_imports=custom_imports_list,
+                relevant_java_files_for_context=relevant_java_files_for_context,
+                test_output_file_path=test_output_file_path,
+                additional_query_instructions="and make sure there are no errors, and you don't cause mismatch in return types and stuff.",
+                requires_db_test=requires_db_test,
+                dependency_signatures=None,
+                target_info=target_info
+            )
             print(f"\n[FINAL SUCCESS] Generated test case saved to: '{test_output_file_path}'")
             print("\n--- FINAL GENERATED TEST CASE (Printed to Console for review) ---")
             print(generated_test_code)
