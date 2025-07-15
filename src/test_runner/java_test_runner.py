@@ -221,7 +221,7 @@ class JavaTestRunner:
                     else:
                         status = "SUCCESS" # Assume success if build success but no test summary (e.g., compile only)
                         message = "Maven build successful (no test summary found)." # More descriptive message
-                    summary = None # No test summary available
+                        summary = None # No test summary available
             else: # Build failed or errored
                 status = "FAILED"
                 if detailed_errors["compilation_errors"]:
