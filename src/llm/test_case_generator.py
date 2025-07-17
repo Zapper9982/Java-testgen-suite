@@ -581,6 +581,7 @@ Instructions:
         main_class_filename = Path(target_info['java_file_path_abs']).name if target_info else None
         with open(target_info['java_file_path_abs'], 'r', encoding='utf-8') as f:
             main_class_code = f.read()
+        main_class_code = strip_java_comments(main_class_code)
         direct_local_deps = self._get_direct_local_imports(main_class_code, SPRING_BOOT_MAIN_JAVA_DIR)
         all_deps = direct_local_deps
         print(f"[STRICT DEBUG] Main class: {main_class_filename}, Direct local deps: {all_deps}")
@@ -696,6 +697,7 @@ Instructions:
         main_class_filename = Path(target_info['java_file_path_abs']).name if target_info else None
         with open(target_info['java_file_path_abs'], 'r', encoding='utf-8') as f:
             main_class_code = f.read()
+        main_class_code = strip_java_comments(main_class_code)
         direct_local_deps = self._get_direct_local_imports(main_class_code, SPRING_BOOT_MAIN_JAVA_DIR)
         all_deps = direct_local_deps
         print(f"[STRICT DEBUG] Main class: {main_class_filename}, Direct local deps: {all_deps}")
@@ -709,6 +711,7 @@ Instructions:
         # Use the full .java file for the main class code
         with open(target_info['java_file_path_abs'], 'r', encoding='utf-8') as f:
             main_code = f.read()
+        main_code = strip_java_comments(main_code)
         full_context += main_code + "\n--- END MAIN CLASS UNDER TEST ---\n\n"
         if test_type != "controller":
             for dep in all_deps:
@@ -786,6 +789,7 @@ Instructions:
             # --- NEW: Use minimal class code for batch ---
             with open(target_info['java_file_path_abs'], 'r', encoding='utf-8') as f:
                 main_code = f.read()
+            main_code = strip_java_comments(main_code)
             # Extract import statements
             import_lines = [line for line in main_code.splitlines() if line.strip().startswith('import ')]
             imports_section = ''
@@ -816,12 +820,64 @@ Instructions:
             print(f"[DEBUG] test_type: {test_type}, batch: {i+1}/{len(batches)}, retry: {retries}")
             while retries < 15 and not success:
                 context = minimal_context  # Use minimal context for every batch
+                prompt = ""
+                previous_test_code = None
+                if retries > 0:
+                    try:
+                        with open(test_output_file_path, 'r', encoding='utf-8') as f:
+                            previous_test_code = f.read()
+                    except Exception:
+                        previous_test_code = None
+                # Add previous output if available
+                if previous_test_code:
+                    prompt += f"PREVIOUS TEST CASE OUTPUT:\n--- BEGIN PREVIOUS OUTPUT ---\n{previous_test_code}\n--- END PREVIOUS OUTPUT ---\n\n"
+                # Add error feedback if available
+                if retries > 0 and error_feedback:
+                    prompt += f"ERROR FEEDBACK FROM PREVIOUS ATTEMPT:\n--- BEGIN ERROR OUTPUT ---\n{error_feedback}\n--- END ERROR OUTPUT ---\n\n"
                 if test_type == "controller":
-                    # ... existing controller prompt logic ...
-                    # (unchanged)
-                    pass  # keep your existing controller prompt logic here
-                elif test_type == "service" or test_type == "repository":
-                    # Service/repository prompt logic
+                    # Add strictest warning at the top of the prompt
+                    strictest_warning = (
+                        "IMPORTANT: You MUST NOT invent, assume, or hallucinate any methods, fields, classes, dependencies, or behaviors that are not explicitly present in the provided code context. "
+                        "If something is missing, leave it out or add a TODO comment. If you are unsure, DO NOT guess. "
+                        "If you hallucinate, you will be penalized and re-prompted.\n\n"
+                    )
+                    prompt += strictest_warning
+                    strict_requirements = """
+STRICT REQUIREMENTS:
+- You MUST use standalone MockMvc with Mockito: use @ExtendWith(MockitoExtension.class), @InjectMocks for the controller, @Mock for dependencies, and initialize MockMvc in @BeforeEach using MockMvcBuilders.standaloneSetup(controller).
+- Do NOT use @WebMvcTest, @MockBean, @Autowired, or @SpringBootTest for controllers.
+- Do NOT use field injection for MockMvc or dependencies.
+- Do NOT generate any code for dependencies. Only generate the test class for the controller. Assume all dependencies exist and are available for mocking.
+- If you use any forbidden annotation or pattern, you will be penalized and re-prompted.
+- Output ONLY compilable Java code, no explanations or markdown.
+- The test class must look like this example (structure, annotations, and setup):
+--- GOOD EXAMPLE (DO THIS) ---
+// ... example omitted for brevity ...
+--- END EXAMPLE ---
+- All test methods must use mockMvc to perform HTTP requests and assert responses.
+- STRICT: Do NOT invent, assume, or hallucinate any code, types, or dependencies not present in the provided context. If something is missing, add a TODO comment or leave it out, but never guess.
+"""
+                    prompt += f"""
+You are an expert Java developer. You are to generate a complete JUnit 5 + Mockito controller test class for the MAIN CLASS below. The other classes are provided as context only (do NOT generate tests for them).
+
+{context}
+
+Instructions:
+- Only generate tests for the MAIN CLASS.
+- Include all necessary imports and annotations.
+- Name the test class {target_class_name}Test and use the package {target_package_name}.
+- Cover ONLY these public methods (do not skip any):\n{method_list_str}
+- For each method, create at least one @Test method that tests its functionality.
+- Use standalone MockMvc for all HTTP request/response assertions.
+- Use @ExtendWith(MockitoExtension.class), @InjectMocks for the controller, @Mock for dependencies, and initialize MockMvc in @BeforeEach using MockMvcBuilders.standaloneSetup(controller).
+- Avoid unnecessary stubbing or mocking. Only mock what is required for compilation or to isolate the class under test. Do NOT mock dependencies that are not used in the test method. Do NOT mock simple POJOs or value objects.
+- Do NOT output explanations, markdown, or comments outside the code.
+- Output ONLY the Java code for the test class, nothing else.
+- Make sure to include @Test annotations on all test methods.
+
+{strict_requirements}
+"""
+                else:
                     strictness = (
                         "IMPORTANT: Only use methods, fields, and constructors that are present in the code blocks below. "
                         "Do NOT invent or assume any methods, fields, or classes. "
@@ -834,9 +890,10 @@ Instructions:
                         "If you are unsure how to verify logging, add a comment in the test indicating what should be checked. "
                         "Generate tests for exception/negative paths (e.g., when repo throws). "
                         "Cover edge cases and all branches (e.g., with/without working location). "
-                        "Do NOT define or create dummy DTOs, entities, or repository interfaces inside the test class. Use only the real classes provided in the context. If a class is missing, do NOT invent it—report an error instead."
+                        "Do NOT define or create dummy DTOs, entities, or repository interfaces inside the test class. Use only the real classes provided in the context. If a class is missing, do NOT invent it—report an error instead. "
+                        "STRICT: Do NOT invent, assume, or hallucinate any code, types, or dependencies not present in the provided context. If something is missing, add a TODO comment or leave it out, but never guess."
                     )
-                    prompt = f"""
+                    prompt += f"""
 You are an expert Java developer. You are to generate a complete JUnit 5 + Mockito test class for the MAIN CLASS below. The other classes are provided as context only (do NOT generate tests for them).
 
 {context}
@@ -854,9 +911,6 @@ Instructions:
 
 {strictness}
 """
-                else:
-                    # Fallback for unknown test_type
-                    prompt = f"ERROR: No valid prompt could be constructed for test_type '{test_type}' in batch {i+1}, retry {retries}."
                 # Print the prompt for every batch attempt
                 print(f"\n[BATCH {i+1} RETRY {retries}] PROMPT SENT TO LLM:\n" + prompt + "\n[END PROMPT]\n")
                 # Debug print: show minimal class code for this batch
@@ -910,8 +964,9 @@ Instructions:
                     full_compilation_error = self.extract_full_compilation_error(stdout)
                     print("\n[DEBUG] FULL COMPILATION ERROR BLOCK EXTRACTED (BATCH):\n" + (full_compilation_error or '[EMPTY]') + "\n[END DEBUG FULL COMPILATION ERROR BLOCK]\n")
                     error_feedback = '\n'.join(error_msgs)
-                    if full_compilation_error:
-                        error_feedback += '\n\n--- FULL COMPILATION ERROR OUTPUT ---\n' + full_compilation_error + '\n--- END FULL COMPILATION ERROR OUTPUT ---\n'
+                    error_block = extract_error_block_after_results(stdout)
+                    if error_block:
+                        error_feedback += '\n\n--- ERROR BLOCK AFTER [INFO] Results: ---\n' + error_block + '\n--- END ERROR BLOCK ---\n'
                     retries += 1
             # Always update final_code with the latest test file after each batch
             with open(test_output_file_path, 'r', encoding='utf-8') as f:
@@ -1753,6 +1808,35 @@ def extract_minimal_class_for_methods(java_code: str, method_names: list, file_p
         result += icb + '\n'
     result += '}'
     return result
+
+# --- Helper: Extract error block after [INFO] Results: ---
+def extract_error_block_after_results(stdout: str) -> str:
+    """
+    Extracts the error block that appears after '[INFO] Results:' and before the next '[INFO]' or end of output.
+    """
+    lines = stdout.splitlines()
+    in_error_block = False
+    error_block = []
+    for line in lines:
+        if '[INFO] Results:' in line:
+            in_error_block = True
+            continue  # Skip the '[INFO] Results:' line itself
+        if in_error_block:
+            if line.startswith('[INFO]') and '[INFO] Results:' not in line:
+                break  # Stop at the next [INFO] section
+            error_block.append(line)
+    return '\n'.join(error_block).strip()
+
+# --- Helper: Strip comments from Java code ---
+def strip_java_comments(code: str) -> str:
+    import re
+    # Remove all /* ... */ comments (including multiline)
+    code = re.sub(r'/\*.*?\*/', '', code, flags=re.DOTALL)
+    # Remove all // ... comments
+    code = re.sub(r'//.*', '', code)
+    # Remove blank lines
+    code = '\n'.join([line for line in code.splitlines() if line.strip()])
+    return code
 
 if __name__ == "__main__":
     try:
