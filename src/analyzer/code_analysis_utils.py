@@ -229,3 +229,28 @@ def resolve_transitive_dependencies(java_file_path: Path, project_main_java_dir:
                 to_visit.append(dep_path)
     return sorted(all_filenames)
 
+
+def resolve_dependency_path(dep_filename, main_class_code, project_root):
+    import re, os
+    dep_basename = dep_filename.replace('.java', '')
+    # Try to find the import statement for this dependency
+    pattern = re.compile(r'import\s+([\w\.]+)\.' + re.escape(dep_basename) + r';')
+    match = pattern.search(main_class_code)
+    package_path = None
+    if match:
+        package_path = match.group(1).replace('.', os.sep)
+        candidate = os.path.join(project_root, package_path, dep_filename)
+        if os.path.exists(candidate):
+            return candidate
+    # Fallback: recursive search for the file in the project tree
+    found = None
+    for root, dirs, files in os.walk(project_root):
+        if dep_filename in files:
+            full_path = os.path.join(root, dep_filename)
+            # Prefer a file whose path includes the expected package
+            if package_path and package_path in root:
+                return full_path
+            if not found:
+                found = full_path
+    return found
+

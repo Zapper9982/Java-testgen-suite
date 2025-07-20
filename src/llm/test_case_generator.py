@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 load_dotenv()
 import javalang
 import traceback
+import subprocess
 
 
 
@@ -38,7 +39,7 @@ if str(TESTGEN_AUTOMATION_SRC_DIR) not in sys.path:
     print(f"Added {TESTGEN_AUTOMATION_SRC_DIR} to sys.path for internal module imports.")
 
 # Import necessary utilities and the new JavaTestRunner
-from analyzer.code_analysis_utils import extract_custom_imports_from_chunk_file, resolve_transitive_dependencies
+from analyzer.code_analysis_utils import extract_custom_imports_from_chunk_file, resolve_transitive_dependencies, resolve_dependency_path
 from test_runner.java_test_runner import JavaTestRunner 
 
 from chroma_db.chroma_client import get_chroma_client, get_or_create_collection
@@ -597,7 +598,7 @@ Instructions:
             dep_code = self._get_full_code_from_chromadb(dep)
             context += f"--- BEGIN DEPENDENCY: {dep} ---\n{dep_code}\n--- END DEPENDENCY: {dep} ---\n\n"
         # Now, use 'context' in the prompt
-        public_methods = self.extract_public_methods(context)
+        public_methods = extract_public_methods(target_info['java_file_path_abs'])
         test_type = self._detect_test_type(target_info) if target_info else None
         if test_type is None:
             test_type = 'service'  # fallback
@@ -717,8 +718,13 @@ Instructions:
             for dep in all_deps:
                 if dep == main_class_filename:
                     continue
-                dep_code = self._get_full_code_from_chromadb(dep)
-                dep_signatures = extract_class_signatures(dep_code)
+                dep_path = resolve_dependency_path(dep, main_code, SPRING_BOOT_MAIN_JAVA_DIR)
+                print(f"[DEBUG] Dependency: {dep}, Resolved path: {dep_path}")
+                if dep_path and os.path.exists(dep_path):
+                    dep_signatures = extract_class_signatures(dep_path)
+                else:
+                    print(f"[WARNING] Could not find dependency file: {dep}")
+                    dep_signatures = f"// Dependency not found: {dep}"
                 full_context += f"--- BEGIN DEPENDENCY SIGNATURES: {dep} ---\n{dep_signatures}\n--- END DEPENDENCY SIGNATURES: {dep} ---\n\n"
         # Extract public methods and endpoint map from the main class code only (not from full_context)
         with open(target_info['java_file_path_abs'], 'r', encoding='utf-8') as f:
@@ -797,7 +803,7 @@ Instructions:
                 imports_section = '--- BEGIN IMPORTS ---\n' + '\n'.join(import_lines) + '\n--- END IMPORTS ---\n\n'
             minimal_class_code = None
             try:
-                minimal_class_code = extract_minimal_class_for_methods(main_code, batch, file_path=target_info['java_file_path_abs'])
+                minimal_class_code = extract_minimal_class_for_methods(target_info['java_file_path_abs'], batch)
             except Exception as e:
                 print(f"[ERROR] Failed to extract minimal class code for batch {i+1}: {e}")
                 traceback.print_exc()
@@ -809,7 +815,7 @@ Instructions:
                 if dep == main_class_filename:
                     continue
                 dep_code = self._get_full_code_from_chromadb(dep)
-                dep_sign = extract_class_signatures(dep_code)
+                dep_sign = extract_class_signatures(dep_path)
                 dep_signatures.append(f"--- BEGIN DEPENDENCY SIGNATURES: {dep} ---\n{dep_sign}\n--- END DEPENDENCY SIGNATURES: {dep} ---\n")
             minimal_context = imports_section
             minimal_context += f"--- BEGIN MAIN CLASS UNDER TEST (MINIMAL) ---\n{minimal_class_code}\n--- END MAIN CLASS UNDER TEST (MINIMAL) ---\n\n"
@@ -1837,6 +1843,50 @@ def strip_java_comments(code: str) -> str:
     # Remove blank lines
     code = '\n'.join([line for line in code.splitlines() if line.strip()])
     return code
+
+# --- JavaParser subprocess bridge integration ---
+# Requires: javabridge/JavaParserBridge.class and lib/javaparser-core-3.25.4.jar
+import subprocess
+JAVAPARSER_JAR = os.path.join('lib', 'javaparser-core-3.25.4.jar')
+JAVAPARSER_BRIDGE_CLASS = 'javabridge.JavaParserBridge'
+
+def run_javaparser_bridge(command, java_file_path, method_names=None):
+    # Always include '.' in the classpath for correct package resolution
+    args = ['java', '-cp', f'{JAVAPARSER_JAR}:javabridge:.', JAVAPARSER_BRIDGE_CLASS, command, java_file_path]
+    if method_names:
+        args.append(','.join(method_names))
+    result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if result.returncode != 0:
+        print(f"[JavaParserBridge ERROR] {result.stderr}")
+        return ""
+    return result.stdout.strip()
+
+def extract_public_methods(java_file_path):
+    output = run_javaparser_bridge('extract_methods', java_file_path)
+    return set(output.split(',')) if output else set()
+
+def extract_class_signatures(java_file_path):
+    return run_javaparser_bridge('extract_signatures', java_file_path)
+
+def extract_minimal_class_for_methods(java_file_path, method_names):
+    return run_javaparser_bridge('extract_minimal_class', java_file_path, method_names)
+
+# --- PATCH: Use file paths for all Java extraction ---
+# Main class extraction
+# public_methods = extract_public_methods(main_class_code) ->
+# public_methods = extract_public_methods(target_info['java_file_path_abs'])
+# minimal_class_code = extract_minimal_class_for_methods(main_code, batch, file_path=target_info['java_file_path_abs']) ->
+# minimal_class_code = extract_minimal_class_for_methods(target_info['java_file_path_abs'], batch)
+# Dependency extraction
+# dep_signatures = extract_class_signatures(dep_code) ->
+# dep_path = resolve_dependency_path(dep, main_class_code, SPRING_BOOT_MAIN_JAVA_DIR)
+# if dep_path and os.path.exists(dep_path):
+#     dep_signatures = extract_class_signatures(dep_path)
+# else:
+#     print(f"[WARNING] Could not find dependency file: {dep}")
+#     dep_signatures = f"// Dependency not found: {dep}"
+# Remove all legacy/duplicate extraction helpers that take code instead of file path.
+# Remove any javalang-based extraction helpers and usages.
 
 if __name__ == "__main__":
     try:
