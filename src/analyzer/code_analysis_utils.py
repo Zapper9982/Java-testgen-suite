@@ -1,6 +1,7 @@
 import re
 from pathlib import Path
 from typing import List, Dict, Any, Union, Optional
+import re, os
 
 # This file (code_analysis_utils.py) is a utility module within the 'analyzer' package.
 # It does not define root paths; those are passed from the calling scripts.
@@ -230,27 +231,70 @@ def resolve_transitive_dependencies(java_file_path: Path, project_main_java_dir:
     return sorted(all_filenames)
 
 
-def resolve_dependency_path(dep_filename, main_class_code, project_root):
-    import re, os
+def build_global_class_map(project_root):
+    """
+    Recursively scan all .java files under project_root and build a mapping from class name to absolute file path.
+    """
+    class_map = {}
+    for root, dirs, files in os.walk(project_root):
+        for file in files:
+            if file.endswith('.java'):
+                abs_path = os.path.join(root, file)
+                try:
+                    with open(abs_path, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                    # Extract package and class name
+                    package_match = re.search(r'package\s+([\w\.]+);', content)
+                    class_match = re.search(r'(?:public\s+)?(?:abstract\s+)?(?:final\s+)?(?:class|interface|enum)\s+([A-Za-z0-9_]+)', content)
+                    if class_match:
+                        class_name = class_match.group(1)
+                        class_map[class_name] = abs_path
+                except Exception as e:
+                    print(f"[build_global_class_map] Error reading {abs_path}: {e}")
+    return class_map
+
+# Update resolve_dependency_path to use global_class_map as fallback
+
+def resolve_dependency_path(dep_filename, main_class_code, project_root, global_class_map=None):
     dep_basename = dep_filename.replace('.java', '')
-    # Try to find the import statement for this dependency
-    pattern = re.compile(r'import\s+([\w\.]+)\.' + re.escape(dep_basename) + r';')
-    match = pattern.search(main_class_code)
-    package_path = None
-    if match:
-        package_path = match.group(1).replace('.', os.sep)
+    import_pattern = re.compile(r'import\s+([\w\.]+)\.([A-Za-z0-9_]+);')
+    class_to_package = {}
+    for match in import_pattern.finditer(main_class_code):
+        pkg = match.group(1)
+        cls = match.group(2)
+        class_to_package[cls] = pkg
+    print(f"[resolve_dependency_path] Import mapping: {class_to_package}")
+    if dep_basename in class_to_package:
+        package_path = class_to_package[dep_basename].replace('.', os.sep)
         candidate = os.path.join(project_root, package_path, dep_filename)
+        print(f"[resolve_dependency_path] Candidate path from import: {candidate}")
         if os.path.exists(candidate):
+            print(f"[resolve_dependency_path] Found file for {dep_filename} at {candidate}")
             return candidate
+        else:
+            print(f"[resolve_dependency_path] Import path for {dep_filename} exists but file not found at {candidate}")
+    # Fallback: use global_class_map if provided
+    if global_class_map and dep_basename in global_class_map:
+        print(f"[resolve_dependency_path] Fallback: Using global_class_map for {dep_basename}: {global_class_map[dep_basename]}")
+        return global_class_map[dep_basename]
     # Fallback: recursive search for the file in the project tree
     found = None
+    matches = []
     for root, dirs, files in os.walk(project_root):
         if dep_filename in files:
             full_path = os.path.join(root, dep_filename)
-            # Prefer a file whose path includes the expected package
-            if package_path and package_path in root:
-                return full_path
-            if not found:
-                found = full_path
-    return found
+            matches.append(full_path)
+    if matches:
+        if dep_basename in class_to_package:
+            package_path = class_to_package[dep_basename].replace('.', os.sep)
+            for m in matches:
+                if package_path in m:
+                    print(f"[resolve_dependency_path] Fallback: Found file for {dep_filename} at {m} (package path match)")
+                    return m
+        if len(matches) > 1:
+            print(f"[resolve_dependency_path] WARNING: Multiple matches for {dep_filename}: {matches}. Using first.")
+        print(f"[resolve_dependency_path] Fallback: Using {matches[0]} for {dep_filename}")
+        return matches[0]
+    print(f"[resolve_dependency_path] ERROR: Could not find file for {dep_filename}")
+    return None
 
