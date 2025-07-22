@@ -25,6 +25,8 @@ public class JavaParserBridge {
             System.exit(2);
         }
         CompilationUnit cu = result.getResult().get();
+        // Remove all comments from the AST
+        cu.getAllContainedComments().forEach(com.github.javaparser.ast.comments.Comment::remove);
 
         switch (command) {
             case "extract_methods":
@@ -80,23 +82,49 @@ public class JavaParserBridge {
 
     private static void printTypeSignature(TypeDeclaration<?> type) {
         if (type instanceof ClassOrInterfaceDeclaration) {
-            System.out.println(getClassSignature((ClassOrInterfaceDeclaration) type) + " {");
-            // Fields
-            for (FieldDeclaration field : ((ClassOrInterfaceDeclaration) type).getFields()) {
-                if (field.isPublic() || field.isProtected())
-                    System.out.println("    " + field.toString().replace("\n", " ").trim());
+            ClassOrInterfaceDeclaration cls = (ClassOrInterfaceDeclaration) type;
+            if (cls.isInterface()) {
+                // Handle interface signature
+                StringBuilder sb = new StringBuilder();
+                if (cls.isPublic()) sb.append("public ");
+                sb.append("interface ").append(cls.getNameAsString());
+                if (cls.getExtendedTypes().size() > 0) {
+                    sb.append(" extends ");
+                    sb.append(cls.getExtendedTypes().stream().map(Object::toString).collect(Collectors.joining(", ")));
+                }
+                sb.append(" {");
+                System.out.println(sb.toString());
+                // Print method signatures
+                for (MethodDeclaration method : cls.getMethods()) {
+                    StringBuilder msig = new StringBuilder();
+                    if (method.isPublic()) msig.append("    public ");
+                    msig.append(method.getType().toString()).append(" ");
+                    msig.append(method.getNameAsString()).append("(");
+                    msig.append(method.getParameters().stream().map(Object::toString).collect(Collectors.joining(", ")));
+                    msig.append(");");
+                    System.out.println(msig.toString());
+                }
+                System.out.println("}");
+            } else {
+                // Existing class logic
+                System.out.println(getClassSignature(cls) + " {");
+                // Fields
+                for (FieldDeclaration field : cls.getFields()) {
+                    if (field.isPublic() || field.isProtected())
+                        System.out.println("    " + field.toString().replace("\n", " ").trim());
+                }
+                // Constructors
+                for (ConstructorDeclaration ctor : cls.getConstructors()) {
+                    if (ctor.isPublic() || ctor.isProtected())
+                        System.out.println("    " + getConstructorSignature(ctor) + ";");
+                }
+                // Methods
+                for (MethodDeclaration method : cls.getMethods()) {
+                    if (method.isPublic() || method.isProtected())
+                        System.out.println("    " + getMethodSignature(method) + ";");
+                }
+                System.out.println("}");
             }
-            // Constructors
-            for (ConstructorDeclaration ctor : ((ClassOrInterfaceDeclaration) type).getConstructors()) {
-                if (ctor.isPublic() || ctor.isProtected())
-                    System.out.println("    " + getConstructorSignature(ctor) + ";");
-            }
-            // Methods
-            for (MethodDeclaration method : ((ClassOrInterfaceDeclaration) type).getMethods()) {
-                if (method.isPublic() || method.isProtected())
-                    System.out.println("    " + getMethodSignature(method) + ";");
-            }
-            System.out.println("}");
         } else if (type instanceof EnumDeclaration) {
             System.out.println("public enum " + type.getNameAsString() + " { ... }");
         } else if (type instanceof AnnotationDeclaration) {

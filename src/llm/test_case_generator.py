@@ -39,7 +39,7 @@ if str(TESTGEN_AUTOMATION_SRC_DIR) not in sys.path:
     print(f"Added {TESTGEN_AUTOMATION_SRC_DIR} to sys.path for internal module imports.")
 
 # Import necessary utilities and the new JavaTestRunner
-from analyzer.code_analysis_utils import extract_custom_imports_from_chunk_file, resolve_transitive_dependencies, resolve_dependency_path
+from analyzer.code_analysis_utils import extract_custom_imports_from_chunk_file, resolve_transitive_dependencies, resolve_dependency_path, build_global_class_map
 from test_runner.java_test_runner import JavaTestRunner 
 
 from chroma_db.chroma_client import get_chroma_client, get_or_create_collection
@@ -582,7 +582,7 @@ Instructions:
         main_class_filename = Path(target_info['java_file_path_abs']).name if target_info else None
         with open(target_info['java_file_path_abs'], 'r', encoding='utf-8') as f:
             main_class_code = f.read()
-        main_class_code = strip_java_comments(main_class_code)
+        main_class_code = strip_java_comments_and_trailing_whitespace(main_class_code)
         direct_local_deps = self._get_direct_local_imports(main_class_code, SPRING_BOOT_MAIN_JAVA_DIR)
         all_deps = direct_local_deps
         print(f"[STRICT DEBUG] Main class: {main_class_filename}, Direct local deps: {all_deps}")
@@ -591,11 +591,13 @@ Instructions:
         print(f"[DEBUG] Actually retrieving code for these files: {files_for_context}")
         context = f"--- BEGIN MAIN CLASS UNDER TEST ---\n"
         main_code = self._get_full_code_from_chromadb(main_class_filename)
+        main_code = strip_java_comments_and_trailing_whitespace(main_code)
         context += main_code + "\n--- END MAIN CLASS UNDER TEST ---\n\n"
         for dep in all_deps:
             if dep == main_class_filename:
                 continue
             dep_code = self._get_full_code_from_chromadb(dep)
+            dep_code = strip_java_comments_and_trailing_whitespace(dep_code)
             context += f"--- BEGIN DEPENDENCY: {dep} ---\n{dep_code}\n--- END DEPENDENCY: {dep} ---\n\n"
         # Now, use 'context' in the prompt
         public_methods = extract_public_methods(target_info['java_file_path_abs'])
@@ -698,7 +700,7 @@ Instructions:
         main_class_filename = Path(target_info['java_file_path_abs']).name if target_info else None
         with open(target_info['java_file_path_abs'], 'r', encoding='utf-8') as f:
             main_class_code = f.read()
-        main_class_code = strip_java_comments(main_class_code)
+        main_class_code = strip_java_comments_and_trailing_whitespace(main_class_code)
         direct_local_deps = self._get_direct_local_imports(main_class_code, SPRING_BOOT_MAIN_JAVA_DIR)
         all_deps = direct_local_deps
         print(f"[STRICT DEBUG] Main class: {main_class_filename}, Direct local deps: {all_deps}")
@@ -712,7 +714,7 @@ Instructions:
         # Use the full .java file for the main class code
         with open(target_info['java_file_path_abs'], 'r', encoding='utf-8') as f:
             main_code = f.read()
-        main_code = strip_java_comments(main_code)
+        main_code = strip_java_comments_and_trailing_whitespace(main_code)
         full_context += main_code + "\n--- END MAIN CLASS UNDER TEST ---\n\n"
         if test_type != "controller":
             for dep in all_deps:
@@ -725,6 +727,7 @@ Instructions:
                 else:
                     print(f"[WARNING] Could not find dependency file: {dep}")
                     dep_signatures = f"// Dependency not found: {dep}"
+                dep_signatures = strip_java_comments_and_trailing_whitespace(dep_signatures)
                 full_context += f"--- BEGIN DEPENDENCY SIGNATURES: {dep} ---\n{dep_signatures}\n--- END DEPENDENCY SIGNATURES: {dep} ---\n\n"
         # Extract public methods and endpoint map from the main class code only (not from full_context)
         with open(target_info['java_file_path_abs'], 'r', encoding='utf-8') as f:
@@ -795,7 +798,7 @@ Instructions:
             # --- NEW: Use minimal class code for batch ---
             with open(target_info['java_file_path_abs'], 'r', encoding='utf-8') as f:
                 main_code = f.read()
-            main_code = strip_java_comments(main_code)
+            main_code = strip_java_comments_and_trailing_whitespace(main_code)
             # Extract import statements
             import_lines = [line for line in main_code.splitlines() if line.strip().startswith('import ')]
             imports_section = ''
@@ -820,7 +823,7 @@ Instructions:
             minimal_context = imports_section
             minimal_context += f"--- BEGIN MAIN CLASS UNDER TEST (MINIMAL) ---\n{minimal_class_code}\n--- END MAIN CLASS UNDER TEST (MINIMAL) ---\n\n"
             minimal_context += "\n".join(dep_signatures)
-            strict_no_comments = '\nSTRICT: Do NOT add any comments to the generated code.\n'
+            strict_no_comments = '\nSTRICT: Do NOT add any comments to the generated code. and MAKE SURE that the code is JUNIT5 + MOCKITO STYLE FOR SERVICES\n'
             minimal_context += strict_no_comments
             prompt = ""  # Always define prompt before use
             print(f"[DEBUG] test_type: {test_type}, batch: {i+1}/{len(batches)}, retry: {retries}")
@@ -828,16 +831,16 @@ Instructions:
                 context = minimal_context  # Use minimal context for every batch
                 prompt = ""
                 previous_test_code = None
-                if retries > 0:
-                    try:
-                        with open(test_output_file_path, 'r', encoding='utf-8') as f:
-                            previous_test_code = f.read()
-                    except Exception:
-                        previous_test_code = None
-                # Add previous output if available
+                # Always read the current test file for every retry (not just for new batches)
+                try:
+                    with open(test_output_file_path, 'r', encoding='utf-8') as f:
+                        previous_test_code = f.read()
+                except Exception:
+                    previous_test_code = None
                 if previous_test_code:
-                    prompt += f"PREVIOUS TEST CASE OUTPUT:\n--- BEGIN PREVIOUS OUTPUT ---\n{previous_test_code}\n--- END PREVIOUS OUTPUT ---\n\n"
-                # Add error feedback if available
+                    prompt += f"PREVIOUS TEST CLASS OUTPUT:\n--- BEGIN PREVIOUS OUTPUT ---\n{previous_test_code}\n--- END PREVIOUS OUTPUT ---\n\n"
+                    prompt += f"Expand and fix the above test class by addressing the errors and adding/fixing tests for the following methods (do NOT duplicate or overwrite existing tests):\n"
+                    prompt += '\n'.join(f'- {m}' for m in batch) + '\n\n'
                 if retries > 0 and error_feedback:
                     prompt += f"ERROR FEEDBACK FROM PREVIOUS ATTEMPT:\n--- BEGIN ERROR OUTPUT ---\n{error_feedback}\n--- END ERROR OUTPUT ---\n\n"
                 if test_type == "controller":
@@ -1328,7 +1331,7 @@ STRICT: You MUST use MockMvc, @WebMvcTest, @MockBean, and @Autowired MockMvc for
         from langchain_google_genai import ChatGoogleGenerativeAI
         import os
         GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-        llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.1)
+        llm = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0.1)
         result = llm.invoke(prompt)
         if hasattr(result, "content"):
             result = result.content
@@ -1834,14 +1837,16 @@ def extract_error_block_after_results(stdout: str) -> str:
     return '\n'.join(error_block).strip()
 
 # --- Helper: Strip comments from Java code ---
-def strip_java_comments(code: str) -> str:
+def strip_java_comments_and_trailing_whitespace(code: str) -> str:
     import re
     # Remove all /* ... */ comments (including multiline)
     code = re.sub(r'/\*.*?\*/', '', code, flags=re.DOTALL)
-    # Remove all // ... comments
+    # Remove all // ... comments (whole line or trailing)
     code = re.sub(r'//.*', '', code)
-    # Remove blank lines
-    code = '\n'.join([line for line in code.splitlines() if line.strip()])
+    # Remove all # ... comments (for Python-style, just in case)
+    code = re.sub(r'#.*', '', code)
+    # Remove lines that are now empty or only whitespace
+    code = '\n'.join([line.rstrip() for line in code.splitlines() if line.strip()])
     return code
 
 # --- JavaParser subprocess bridge integration ---
