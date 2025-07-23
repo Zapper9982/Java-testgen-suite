@@ -32,6 +32,47 @@ Our suite follows a structured approach to dynamically generate relevant test ca
 - `pre-processing/` — Preprocessing utilities
 - `src/` — Core modules (LLM, analyzer, test runner, chroma client)
 - `processed_output/`, `chunked_output/`, `analysis_results/` — Intermediate data
+- `javabridge/` — Java subprocess bridge for robust Java parsing (uses JavaParser)
+- `lib/` — External Java libraries (e.g., JavaParser JARs)
+
+---
+
+## 🗂️ Directory Tree & Explanations
+
+```
+Java-testgen-suite/
+├── analysis_results/         # Stores discovered Spring Boot targets (JSON)
+├── chroma_db/               # ChromaDB client and helpers
+├── javabridge/              # JavaParserBridge for robust Java parsing
+├── lib/                     # JavaParser JARs
+├── pre-processing/          # Java code cleaning scripts
+├── processed_output/        # Cleaned Java files for chunking
+├── scripts/                 # Chunking, embedding, and indexing scripts
+├── src/
+│   ├── analyzer/            # Code analysis utilities
+│   ├── llm/                 # Main LLM test generation logic
+│   └── test_runner/         # Java test runner integration
+├── .env                     # Environment variables
+├── run.sh                   # Main pipeline entrypoint
+├── README.md
+└── requirements.txt
+```
+
+**Directory/Module Explanations:**
+- **analysis_results/**: Output of code analysis (e.g., discovered services/controllers and their dependencies).
+- **chroma_db/**: Python modules for interacting with ChromaDB, the vector database used for code and test chunk retrieval.
+- **javabridge/**: Java code (and compiled classes) for robust Java parsing using JavaParser, called from Python via subprocess.
+- **lib/**: Holds external Java libraries required by the Java bridge (e.g., JavaParser JAR).
+- **pre-processing/**: Scripts for cleaning Java source files (removing comments, normalizing whitespace) before chunking.
+- **processed_output/**: Output directory for cleaned Java files, used as input for chunking and embedding.
+- **scripts/**: Utility scripts for chunking code, embedding into ChromaDB, and indexing real test/source examples.
+- **src/analyzer/**: Python modules for analyzing the Java codebase to discover Spring Boot services/controllers and their dependencies.
+- **src/llm/**: Main logic for LLM-powered test generation, including batching, feedback, and prompt templates.
+- **src/test_runner/**: Runs generated tests using Maven/Gradle and parses the results for feedback.
+- **.env**: Stores environment variables such as API keys and project paths.
+- **run.sh**: Main shell script to run the full pipeline.
+- **README.md**: Documentation for setup and usage.
+- **requirements.txt**: Python dependencies for the project.
 
 ---
 
@@ -142,6 +183,8 @@ Set these in your shell or in `run.sh` before running the pipeline.
 - **ChromaDB errors:** Ensure ChromaDB is installed and accessible.
 - **Test failures:** Check the output logs for suggestions and error details.
 - **Empty scripts:** Some scripts (e.g., `rebuild_chroma.py`, `main.py`) are placeholders for future automation.
+- **JavaParser errors:** If you see parsing errors, check that your Java files are complete and valid. The pipeline prints problematic code snippets for debugging.
+- **Apple Silicon Support:** Embedding runs on `mps` device if available for faster processing.
 
 ---
 
@@ -152,15 +195,42 @@ Set these in your shell or in `run.sh` before running the pipeline.
 - **Retrieval QA Chain Initiated:** LangChain QA retrieval chain fetches relevant documents for LLM queries.
 - **Test Example Indexing:** Real test/source pairs indexed for RAG-based test generation.
 - **LLM Integration:** Supports Gemini-1.5-flash and Groq Llama (llama3-8b-8192) for test generation.
+- **Batch Mode:** For large classes, tests are generated in batches (e.g., 3 methods at a time) with minimal class context to avoid LLM context limits.
+- **Minimal Class Extraction:** Uses a Java subprocess (`javabridge/JavaParserBridge.java`) for robust extraction of only the methods and fields needed for each batch.
+- **Strict Prompting:** Prompts enforce no hallucinated methods, fields, or classes; only use code present in the provided context; proper use of JUnit 5 and Mockito; no unnecessary mocking or stubbing.
+- **Feedback Loop:** If generated tests fail to compile or run, errors are parsed and used to re-prompt the LLM for corrections.
+- **Full Project Test Verification:** After all tests are generated, the pipeline will run a full `mvn clean verify` or `gradle clean test` to ensure all generated tests compile and pass.
 
 ---
 
 ## 🛠️ Tech Stack
 
-- **Python:** Orchestrates the entire suite.
-- **LangChain:** Semantic chunking and QA retrieval chain.
-- **ChromaDB:** Vector database for code chunk storage and retrieval.
-- **Hugging Face (BAAI/bge-small-en-v1.5):** Embedding model for code chunks.
-- **LLM Models:** Groq Llama, Gemini-1.5-flash, OpenAI, Anthropic (pluggable).
+- **Python 3.8+** — Orchestrates the entire suite.
+- **Java** — Used for robust Java parsing via JavaParserBridge.
+- **LangChain** — Semantic chunking, QA retrieval, and LLM orchestration.
+- **ChromaDB** — Vector database for code/test chunk storage and retrieval.
+- **Hugging Face Transformers** — Embedding model for code chunks (e.g., BAAI/bge-small-en-v1.5).
+- **Sentence Transformers** — For additional embedding support.
+- **LLM Models:** Google Gemini (via LangChain), Groq Llama, OpenAI, Anthropic (pluggable).
+- **javalang** — Lightweight Java AST parsing in Python.
+- **JavaParser** — Via Java subprocess for signature/minimal class extraction.
+- **Spring Boot** — Target Java project.
+- **Maven/Gradle** — Test execution and verification.
+- **dotenv** — For environment variable management.
+- **torch** — For device selection (e.g., Apple Silicon MPS support for embeddings).
 
+---
 
+## ❓ FAQ
+
+- **Q: Where are generated tests saved?**  
+  A: In your Spring Boot project under `src/test/java/` in the correct package.
+
+- **Q: What if a test file already exists?**  
+  A: The pipeline skips generation for existing test files.
+
+- **Q: How do I add more real test examples for RAG?**  
+  A: Use `scripts/index_test_examples.py` to index more test/source pairs.
+
+- **Q: What if I get JavaParser errors?**  
+  A: Ensure your Java files are complete and valid. The pipeline prints problematic code snippets for debugging.
