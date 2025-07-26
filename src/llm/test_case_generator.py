@@ -864,15 +864,26 @@ Instructions:
             minimal_context += "\n".join(dep_signatures)
             strict_no_comments = '\nSTRICT: Do NOT add any comments to the generated code. and MAKE SURE that the code is JUNIT5 + MOCKITO STYLE FOR SERVICES\n'
             minimal_context += strict_no_comments
+            
+            # Update package name to reflect the new folder structure
+            batch_package_name = f"{target_package_name}.{target_class_name}Test"
+            
+            # Create a folder for this class's test batches
+            class_test_folder = test_output_file_path.parent / f"{target_class_name}Test"
+            class_test_folder.mkdir(parents=True, exist_ok=True)
+            
+            # Define the batch test file path
+            batch_test_output_path = class_test_folder / f"{target_class_name}Test_Batch{i+1}.java"
+            
             prompt = ""  # Always define prompt before use
             print(f"[DEBUG] test_type: {test_type}, batch: {i+1}/{len(batches)}, retry: {retries}")
             while retries < 15 and not success:
                 context = minimal_context  # Use minimal context for every batch
                 prompt = ""
                 previous_test_code = None
-                # Always read the current test file for every retry (not just for new batches)
+                # Always read the current batch test file for every retry (not just for new batches)
                 try:
-                    with open(test_output_file_path, 'r', encoding='utf-8') as f:
+                    with open(batch_test_output_path, 'r', encoding='utf-8') as f:
                         previous_test_code = f.read()
                 except Exception:
                     previous_test_code = None
@@ -913,7 +924,7 @@ You are an expert Java developer. You are to generate a complete JUnit 5 + Mocki
 Instructions:
 - Only generate tests for the MAIN CLASS.
 - Include all necessary imports and annotations.
-- Name the test class {target_class_name}Test and use the package {target_package_name}.
+- Name the test class {target_class_name}Test_Batch{i+1} and use the package {batch_package_name}.
 - Cover ONLY these public methods (do not skip any):\n{method_list_str}
 - For each method, create at least one @Test method that tests its functionality.
 - Use standalone MockMvc for all HTTP request/response assertions.
@@ -949,7 +960,7 @@ You are an expert Java developer. You are to generate a complete JUnit 5 + Mocki
 Instructions:
 - Only generate tests for the MAIN CLASS.
 - Include all necessary imports and annotations.
-- Name the test class {target_class_name}Test and use the package {target_package_name}.
+- Name the test class {target_class_name}Test_Batch{i+1} and use the package {batch_package_name}.
 - Cover ONLY these public methods (do not skip any):\n{method_list_str}
 - For each method, create at least one @Test method that tests its functionality.
 - Avoid unnecessary stubbing or mocking. Only mock what is required for compilation or to isolate the class under test. Do NOT mock dependencies that are not used in the test method. Do NOT mock simple POJOs or value objects.
@@ -972,17 +983,11 @@ Instructions:
                 code = re.sub(r'^```', '', code)
                 code = re.sub(r'```$', '', code)
                 code = code.strip()
-                if i == 0:
-                    # First batch: write the full class
-                    test_output_file_path.parent.mkdir(parents=True, exist_ok=True)
-                    with open(test_output_file_path, 'w', encoding='utf-8') as f:
-                        f.write(code)
-                else:
-                    # For subsequent batches, overwrite the test file with the new full class
-                    with open(test_output_file_path, 'w', encoding='utf-8') as f:
-                        f.write(code)
+                # Write to the class-specific folder
+                with open(batch_test_output_path, 'w', encoding='utf-8') as f:
+                    f.write(code)
                 # Run the test file
-                test_run_results = self.java_test_runner.run_test(test_output_file_path)
+                test_run_results = self.java_test_runner.run_test(batch_test_output_path)
                 compilation_errors = test_run_results['detailed_errors'].get('compilation_errors', [])
                 test_failures = test_run_results['detailed_errors'].get('test_failures', [])
                 tests_run_zero = False
@@ -1018,7 +1023,7 @@ Instructions:
                         error_feedback += '\n\n--- ERROR BLOCK AFTER [INFO] Results: ---\n' + error_block + '\n--- END ERROR BLOCK ---\n'
                     retries += 1
             # Always update final_code with the latest test file after each batch
-            with open(test_output_file_path, 'r', encoding='utf-8') as f:
+            with open(batch_test_output_path, 'r', encoding='utf-8') as f:
                 final_code = f.read()
         # After all batches:
         return final_code
@@ -1861,7 +1866,7 @@ def extract_minimal_class_for_methods(java_code: str, method_names: list, file_p
 # --- Helper: Extract error block after [INFO] Results: ---
 def extract_error_block_after_results(stdout: str) -> str:
     """
-    Extracts the error block that appears after '[INFO] Results:' and before the next '[INFO]' or end of output.
+    Extracts the error block that appears after '[INFO] Results:' and before the line containing '[ERROR] There are test failures' (inclusive).
     """
     lines = stdout.splitlines()
     in_error_block = False
@@ -1871,9 +1876,9 @@ def extract_error_block_after_results(stdout: str) -> str:
             in_error_block = True
             continue  # Skip the '[INFO] Results:' line itself
         if in_error_block:
-            if line.startswith('[INFO]') and '[INFO] Results:' not in line:
-                break  # Stop at the next [INFO] section
             error_block.append(line)
+            if '[ERROR] There are test failures' in line:
+                break  # Stop after including this line
     return '\n'.join(error_block).strip()
 
 # --- Helper: Strip comments from Java code ---
