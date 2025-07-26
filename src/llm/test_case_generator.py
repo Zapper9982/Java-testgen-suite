@@ -66,7 +66,7 @@ if not GOOGLE_API_KEY:
     print("Example: export GOOGLE_API_KEY='your_google_api_key_here'")
 
 # LLM model definition - Using Gemini 1.5 Flash for potentially better rate limits and speed
-LLM_MODEL_NAME_GEMINI = "gemini-2.5-flash" 
+LLM_MODEL_NAME_GEMINI = "gemini-2.5-pro" 
 
 EMBEDDING_MODEL_NAME_BGE = "BAAI/bge-small-en-v1.5"
 # Use 'mps' for Apple Silicon (M1/M2/M3 chips) if available, otherwise 'cpu'
@@ -633,7 +633,7 @@ Instructions:
             test_output_file_path.parent.mkdir(parents=True, exist_ok=True)
             with open(test_output_file_path, 'w', encoding='utf-8') as f:
                 f.write(code)
-            # Run the test file
+      
             test_run_results = self.java_test_runner.run_test(test_output_file_path)
             compilation_errors = test_run_results['detailed_errors'].get('compilation_errors', [])
             test_failures = test_run_results['detailed_errors'].get('test_failures', [])
@@ -811,15 +811,54 @@ Instructions:
                 print(f"[ERROR] Failed to extract minimal class code for batch {i+1}: {e}")
                 traceback.print_exc()
                 minimal_class_code = main_code  # fallback
-            # --- PATCH: Use only direct dependencies for all referenced types ---
-            # Remove transitive dependency resolution; use only direct_local_deps
+            # --- PATCH: Only include dependency signatures for types referenced in minimal class ---
+            referenced_types = extract_referenced_types(target_info['java_file_path_abs'], batch)
             dep_signatures = []
-            for dep in all_deps:
-                if dep == main_class_filename:
-                    continue
-                dep_code = self._get_full_code_from_chromadb(dep)
-                dep_sign = extract_class_signatures(dep_path)
-                dep_signatures.append(f"--- BEGIN DEPENDENCY SIGNATURES: {dep} ---\n{dep_sign}\n--- END DEPENDENCY SIGNATURES: {dep} ---\n")
+            included_deps = []
+            
+            # Extract types that are actually used in the minimal class code
+            minimal_class_types = set()
+            if minimal_class_code:
+                # Look for field declarations and method calls in the minimal class
+                lines = minimal_class_code.split('\n')
+                for line in lines:
+                    line = line.strip()
+                    # Look for field declarations like: private SomeType fieldName;
+                    if line.startswith('private ') or line.startswith('@Autowired private ') or line.startswith('@PersistenceContext private '):
+                        parts = line.split()
+                        if len(parts) >= 3:
+                            # Handle @Autowired private SomeType fieldName;
+                            if line.startswith('@Autowired private '):
+                                type_name = parts[2]  # The type name after @Autowired private
+                            else:
+                                type_name = parts[1]  # The type name after private
+                            if type_name and not type_name.startswith('static') and not type_name.startswith('final'):
+                                minimal_class_types.add(type_name)
+                    # Look for method calls like: someType.method()
+                    elif '.' in line and '(' in line:
+                        parts = line.split('.')
+                        if len(parts) >= 2:
+                            field_name = parts[0].strip()
+                            if field_name and not field_name.startswith('//'):
+                                # Try to find the type of this field
+                                for ref_type in referenced_types:
+                                    if ref_type.lower().endswith(field_name.lower()) or field_name.lower() in ref_type.lower():
+                                        minimal_class_types.add(ref_type)
+                                        break
+            
+            # Only include dependency signatures for types actually used in minimal class
+            for dep_type in referenced_types:
+                if dep_type in minimal_class_types:
+                    dep_path = resolve_dependency_path(dep_type + '.java', main_code, SPRING_BOOT_MAIN_JAVA_DIR)
+                    if dep_path and os.path.exists(dep_path):
+                        dep_sign = extract_class_signatures(dep_path)
+                        dep_signatures.append(f"--- BEGIN DEPENDENCY SIGNATURES: {dep_type} ---\n{dep_sign}\n--- END DEPENDENCY SIGNATURES: {dep_type} ---\n")
+                        included_deps.append(dep_type)
+            
+            if included_deps:
+                print(f"[BATCH {i+1}] Including dependency signatures in prompt: {included_deps}")
+            else:
+                print(f"[BATCH {i+1}] No dependency signatures included (no local dependencies found)")
             minimal_context = imports_section
             minimal_context += f"--- BEGIN MAIN CLASS UNDER TEST (MINIMAL) ---\n{minimal_class_code}\n--- END MAIN CLASS UNDER TEST (MINIMAL) ---\n\n"
             minimal_context += "\n".join(dep_signatures)
@@ -915,6 +954,7 @@ Instructions:
 - For each method, create at least one @Test method that tests its functionality.
 - Avoid unnecessary stubbing or mocking. Only mock what is required for compilation or to isolate the class under test. Do NOT mock dependencies that are not used in the test method. Do NOT mock simple POJOs or value objects.
 - Do NOT output explanations, markdown, or comments outside the code.
+- Do NOT USE RelfectionTestUtils 
 - Output ONLY the Java code for the test class, nothing else.
 - Make sure to include @Test annotations on all test methods.
 
@@ -1876,22 +1916,11 @@ def extract_class_signatures(java_file_path):
 def extract_minimal_class_for_methods(java_file_path, method_names):
     return run_javaparser_bridge('extract_minimal_class', java_file_path, method_names)
 
-# --- PATCH: Use file paths for all Java extraction ---
-# Main class extraction
-# public_methods = extract_public_methods(main_class_code) ->
-# public_methods = extract_public_methods(target_info['java_file_path_abs'])
-# minimal_class_code = extract_minimal_class_for_methods(main_code, batch, file_path=target_info['java_file_path_abs']) ->
-# minimal_class_code = extract_minimal_class_for_methods(target_info['java_file_path_abs'], batch)
-# Dependency extraction
-# dep_signatures = extract_class_signatures(dep_code) ->
-# dep_path = resolve_dependency_path(dep, main_class_code, SPRING_BOOT_MAIN_JAVA_DIR)
-# if dep_path and os.path.exists(dep_path):
-#     dep_signatures = extract_class_signatures(dep_path)
-# else:
-#     print(f"[WARNING] Could not find dependency file: {dep}")
-#     dep_signatures = f"// Dependency not found: {dep}"
-# Remove all legacy/duplicate extraction helpers that take code instead of file path.
-# Remove any javalang-based extraction helpers and usages.
+def extract_referenced_types(java_file_path, method_names):
+    output = run_javaparser_bridge('extract_referenced_types', java_file_path, method_names)
+    if not output:
+        return set()
+    return set([t.strip() for t in output.split(',') if t.strip()])
 
 if __name__ == "__main__":
     try:

@@ -4,6 +4,13 @@ package javabridge;
 import com.github.javaparser.*;
 import com.github.javaparser.ast.body.*;
 import com.github.javaparser.ast.*;
+import com.github.javaparser.ast.visitor.VoidVisitorAdapter;
+import com.github.javaparser.ast.expr.ObjectCreationExpr;
+import com.github.javaparser.ast.expr.VariableDeclarationExpr;
+import com.github.javaparser.ast.expr.FieldAccessExpr;
+import com.github.javaparser.ast.expr.MethodCallExpr;
+import com.github.javaparser.ast.type.ClassOrInterfaceType;
+import com.github.javaparser.ast.type.Type;
 
 import java.nio.file.*;
 import java.util.*;
@@ -60,19 +67,153 @@ public class JavaParserBridge {
                     System.exit(1);
                 }
                 Set<String> targetMethods = new HashSet<>(Arrays.asList(args[2].split(",")));
+                Set<String> usedFields = new HashSet<>();
+                Set<String> usedTypes = new HashSet<>();
+                Optional<ClassOrInterfaceDeclaration> mainClassOpt = cu.findFirst(ClassOrInterfaceDeclaration.class);
+                if (!mainClassOpt.isPresent()) {
+                    System.out.println("");
+                    break;
+                }
+                ClassOrInterfaceDeclaration mainClass = mainClassOpt.get();
+                Map<String, MethodDeclaration> methodMap = new HashMap<>();
+                for (MethodDeclaration md : mainClass.getMethods()) {
+                    methodMap.put(md.getNameAsString(), md);
+                }
+                Set<String> toVisit = new HashSet<>(targetMethods);
+                Set<String> visited = new HashSet<>();
+                while (!toVisit.isEmpty()) {
+                    String m = toVisit.iterator().next();
+                    toVisit.remove(m);
+                    if (!visited.add(m)) continue;
+                    MethodDeclaration md = methodMap.get(m);
+                    if (md == null) continue;
+                    md.accept(new VoidVisitorAdapter<Void>() {
+                        @Override
+                        public void visit(FieldAccessExpr n, Void arg) {
+                            usedFields.add(n.getNameAsString());
+                            super.visit(n, arg);
+                        }
+                        @Override
+                        public void visit(MethodCallExpr n, Void arg) {
+                            n.getScope().ifPresent(scope -> {
+                                if (scope.isThisExpr() || scope.isSuperExpr()) {
+                                    String called = n.getNameAsString();
+                                    if (methodMap.containsKey(called) && !visited.contains(called)) {
+                                        toVisit.add(called);
+                                    }
+                                } else if (scope.isNameExpr()) {
+                                    // This captures field references like: benCompleteMapper.benDetailForOutboundDTOToIBeneficiary()
+                                    String fieldName = scope.asNameExpr().getNameAsString();
+                                    usedFields.add(fieldName);
+                                }
+                            });
+                            super.visit(n, arg);
+                        }
+                        @Override
+                        public void visit(ClassOrInterfaceType n, Void arg) {
+                            usedTypes.add(n.getNameAsString());
+                            super.visit(n, arg);
+                        }
+                    }, null);
+                }
                 cu.findAll(ClassOrInterfaceDeclaration.class).forEach(cls -> {
                     System.out.println(getClassSignature(cls) + " {");
-                    // Fields
                     for (FieldDeclaration field : cls.getFields()) {
-                        System.out.println("    " + field.toString().replace("\n", " ").trim());
+                        boolean isUsed = false;
+                        for (VariableDeclarator vd : field.getVariables()) {
+                            if (usedFields.contains(vd.getNameAsString())) {
+                                isUsed = true;
+                                break;
+                            }
+                        }
+                        if (isUsed) {
+                            System.out.println("    " + field.toString().replace("\n", " ").trim());
+                        }
                     }
-                    // Only requested methods
                     for (MethodDeclaration method : cls.getMethods()) {
                         if (targetMethods.contains(method.getNameAsString()))
                             System.out.println("    " + method.toString().replace("\n", "\n    ").trim());
                     }
                     System.out.println("}");
                 });
+                break;
+            case "extract_referenced_types":
+                if (args.length < 3) {
+                    System.err.println("Usage: JavaParserBridge extract_referenced_types <file> method1,method2,...");
+                    System.exit(1);
+                }
+                Set<String> batchMethods = new HashSet<>(Arrays.asList(args[2].split(",")));
+                Set<String> referencedTypes = new HashSet<>();
+                Optional<ClassOrInterfaceDeclaration> mainClassOpt2 = cu.findFirst(ClassOrInterfaceDeclaration.class);
+                if (!mainClassOpt2.isPresent()) {
+                    System.out.println("");
+                    break;
+                }
+                ClassOrInterfaceDeclaration mainClass2 = mainClassOpt2.get();
+                Map<String, MethodDeclaration> methodMap2 = new HashMap<>();
+                for (MethodDeclaration md : mainClass2.getMethods()) {
+                    methodMap2.put(md.getNameAsString(), md);
+                }
+                // Recursively collect all methods called by the batch
+                Set<String> toVisit2 = new HashSet<>(batchMethods);
+                Set<String> visited2 = new HashSet<>();
+                while (!toVisit2.isEmpty()) {
+                    String m = toVisit2.iterator().next();
+                    toVisit2.remove(m);
+                    if (!visited2.add(m)) continue;
+                    MethodDeclaration md = methodMap2.get(m);
+                    if (md == null) continue;
+                    // Collect types from signature
+                    if (md.getType() != null) referencedTypes.add(md.getType().toString());
+                    for (Parameter p : md.getParameters()) referencedTypes.add(p.getType().toString());
+                    for (Type t : md.getThrownExceptions()) referencedTypes.add(t.toString());
+                    // Collect types from body
+                    md.accept(new VoidVisitorAdapter<Void>() {
+                        @Override
+                        public void visit(ObjectCreationExpr n, Void arg) {
+                            referencedTypes.add(n.getType().toString());
+                            super.visit(n, arg);
+                        }
+                        @Override
+                        public void visit(VariableDeclarationExpr n, Void arg) {
+                            referencedTypes.add(n.getElementType().toString());
+                            super.visit(n, arg);
+                        }
+                        @Override
+                        public void visit(FieldAccessExpr n, Void arg) {
+                            referencedTypes.add(n.getScope().toString());
+                            super.visit(n, arg);
+                        }
+                        @Override
+                        public void visit(MethodCallExpr n, Void arg) {
+                            n.getScope().ifPresent(scope -> {
+                                if (scope.isThisExpr() || scope.isSuperExpr() || scope.isNameExpr()) {
+                                    String called = n.getNameAsString();
+                                    if (methodMap2.containsKey(called) && !visited2.contains(called)) {
+                                        toVisit2.add(called);
+                                    }
+                                }
+                            });
+                            super.visit(n, arg);
+                        }
+                        @Override
+                        public void visit(ClassOrInterfaceType n, Void arg) {
+                            referencedTypes.add(n.getNameAsString());
+                            super.visit(n, arg);
+                        }
+                    }, null);
+                }
+                // Also collect field types used by these methods
+                for (FieldDeclaration fd : mainClass2.getFields()) {
+                    for (VariableDeclarator vd : fd.getVariables()) {
+                        referencedTypes.add(vd.getType().toString());
+                    }
+                }
+                // Remove primitives and java.lang
+                Set<String> filtered = referencedTypes.stream()
+                    .filter(t -> !t.matches("int|long|double|float|boolean|char|byte|short|void|String"))
+                    .collect(Collectors.toSet());
+                System.out.println(String.join(",", filtered));
                 break;
             default:
                 System.err.println("Unknown command: " + command);

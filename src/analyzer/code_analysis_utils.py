@@ -233,7 +233,7 @@ def resolve_transitive_dependencies(java_file_path: Path, project_main_java_dir:
 
 def build_global_class_map(project_root):
     """
-    Recursively scan all .java files under project_root and build a mapping from class name to absolute file path.
+    Recursively scan all .java files under project_root and build a mapping from class name to a list of (package, file_path) tuples.
     """
     class_map = {}
     for root, dirs, files in os.walk(project_root):
@@ -243,20 +243,48 @@ def build_global_class_map(project_root):
                 try:
                     with open(abs_path, 'r', encoding='utf-8') as f:
                         content = f.read()
-                    # Extract package and class name
                     package_match = re.search(r'package\s+([\w\.]+);', content)
                     class_match = re.search(r'(?:public\s+)?(?:abstract\s+)?(?:final\s+)?(?:class|interface|enum)\s+([A-Za-z0-9_]+)', content)
                     if class_match:
                         class_name = class_match.group(1)
-                        class_map[class_name] = abs_path
+                        package = package_match.group(1) if package_match else ''
+                        class_map.setdefault(class_name, []).append((package, abs_path))
                 except Exception as e:
                     print(f"[build_global_class_map] Error reading {abs_path}: {e}")
     return class_map
 
-# Update resolve_dependency_path to use global_class_map as fallback
 
 def resolve_dependency_path(dep_filename, main_class_code, project_root, global_class_map=None):
     dep_basename = dep_filename.replace('.java', '')
+    main_class_package = ''
+    package_match = re.search(r'package\s+([\w\.]+);', main_class_code)
+    if package_match:
+        main_class_package = package_match.group(1)
+    # Always use global_class_map as primary method
+    if global_class_map and dep_basename in global_class_map:
+        candidates = global_class_map[dep_basename]
+        print(f"[resolve_dependency_path] Candidates for {dep_basename}: {candidates}")
+        if len(candidates) == 1:
+            print(f"[resolve_dependency_path] Using only candidate for {dep_basename}: {candidates[0][1]}")
+            return candidates[0][1]
+        # Prefer the file whose package most closely matches the main class's package
+        def package_distance(pkg1, pkg2):
+            # Lower distance = more similar
+            if not pkg1 or not pkg2:
+                return 1000
+            pkg1_parts = pkg1.split('.')
+            pkg2_parts = pkg2.split('.')
+            common = 0
+            for a, b in zip(pkg1_parts, pkg2_parts):
+                if a == b:
+                    common += 1
+                else:
+                    break
+            return -(common)  # More common = lower (more negative)
+        best = max(candidates, key=lambda tup: package_distance(main_class_package, tup[0]))
+        print(f"[resolve_dependency_path] Chose {best[1]} for {dep_basename} (best package match to {main_class_package})")
+        return best[1]
+    # Fallback: import-based (legacy, rarely used)
     import_pattern = re.compile(r'import\s+([\w\.]+)\.([A-Za-z0-9_]+);')
     class_to_package = {}
     for match in import_pattern.finditer(main_class_code):
@@ -273,10 +301,6 @@ def resolve_dependency_path(dep_filename, main_class_code, project_root, global_
             return candidate
         else:
             print(f"[resolve_dependency_path] Import path for {dep_filename} exists but file not found at {candidate}")
-    # Fallback: use global_class_map if provided
-    if global_class_map and dep_basename in global_class_map:
-        print(f"[resolve_dependency_path] Fallback: Using global_class_map for {dep_basename}: {global_class_map[dep_basename]}")
-        return global_class_map[dep_basename]
     # Fallback: recursive search for the file in the project tree
     found = None
     matches = []
@@ -285,15 +309,7 @@ def resolve_dependency_path(dep_filename, main_class_code, project_root, global_
             full_path = os.path.join(root, dep_filename)
             matches.append(full_path)
     if matches:
-        if dep_basename in class_to_package:
-            package_path = class_to_package[dep_basename].replace('.', os.sep)
-            for m in matches:
-                if package_path in m:
-                    print(f"[resolve_dependency_path] Fallback: Found file for {dep_filename} at {m} (package path match)")
-                    return m
-        if len(matches) > 1:
-            print(f"[resolve_dependency_path] WARNING: Multiple matches for {dep_filename}: {matches}. Using first.")
-        print(f"[resolve_dependency_path] Fallback: Using {matches[0]} for {dep_filename}")
+        print(f"[resolve_dependency_path] WARNING: global_class_map did not resolve {dep_basename}, found matches: {matches}. Using first.")
         return matches[0]
     print(f"[resolve_dependency_path] ERROR: Could not find file for {dep_filename}")
     return None
