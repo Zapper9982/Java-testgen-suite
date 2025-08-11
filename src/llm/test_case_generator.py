@@ -94,6 +94,10 @@ def estimate_token_count(text: str) -> int:
 MAX_TOTAL_TOKENS = 45000  # Stay below 50K for safety
 MIN_K = 3  # Minimum number of context chunks
 
+# Control incremental merging behavior
+ENABLE_INCREMENTAL_MERGE = os.getenv("ENABLE_INCREMENTAL_MERGE", "true").strip().lower() in {"1", "true", "yes", "y"}
+KEEP_BATCH_FILES_ON_MERGE_FAILURE = os.getenv("KEEP_BATCH_FILES_ON_MERGE_FAILURE", "true").strip().lower() in {"1", "true", "yes", "y"}
+
 def get_test_paths(relative_filepath_from_processed_output: str, project_root: Path):
     """
     Generates the expected output paths for the test file based on the path
@@ -775,6 +779,11 @@ Instructions:
             return "// No public methods found to test."
         batch_size = 3
         batches = [public_methods[i:i+batch_size] for i in range(0, len(public_methods), batch_size)]
+        
+        # Initialize incremental merging variables
+        merged_test_class = None
+        merged_test_file_path = test_output_file_path  # The final merged file
+        
         final_code = None
         for i, batch in enumerate(batches):
             # --- ADDED: Check for batch method name mismatches ---
@@ -866,7 +875,7 @@ Instructions:
             minimal_context += strict_no_comments
             
             # Update package name to reflect the new folder structure
-            batch_package_name = f"{target_package_name}.{target_class_name}Test"
+            batch_package_name = target_package_name  # Use original package name, not with Test suffix
             
             # Create a folder for this class's test batches
             class_test_folder = test_output_file_path.parent / f"{target_class_name}Test"
@@ -983,11 +992,43 @@ Instructions:
                 code = re.sub(r'^```', '', code)
                 code = re.sub(r'```$', '', code)
                 code = code.strip()
-                # Write to the class-specific folder
-                with open(batch_test_output_path, 'w', encoding='utf-8') as f:
-                    f.write(code)
-                # Run the test file
-                test_run_results = self.java_test_runner.run_test(batch_test_output_path)
+                
+                # Implement incremental merging logic
+                if ENABLE_INCREMENTAL_MERGE:
+                    if i == 0:
+                        # First batch: initialize merged test class
+                        merged_test_class = code
+                        print(f"[MERGE] Initialized merged test class for {target_class_name}")
+                    else:
+                        # Subsequent batches: LLM merge
+                        print(f"[MERGE] Merging batch {i+1} into existing test class...")
+                        try:
+                            merged_test_class = self.merge_batch_with_existing_test_class(
+                                merged_test_class, code, target_class_name, target_package_name, test_type
+                            )
+                            print(f"[MERGE] Successfully merged batch {i+1}")
+                        except Exception as merge_error:
+                            print(f"[MERGE][ERROR] Failed to merge batch {i+1}: {merge_error}")
+                            # Fallback: keep batch separate
+                            merged_test_class = code
+                    
+                    # Write merged class to final file
+                    with open(merged_test_file_path, 'w', encoding='utf-8') as f:
+                        f.write(merged_test_class)
+                    
+                    # Also write to batch file for debugging
+                    with open(batch_test_output_path, 'w', encoding='utf-8') as f:
+                        f.write(code)
+                    
+                    # Run tests on merged file (not batch file)
+                    test_run_results = self.java_test_runner.run_test(merged_test_file_path)
+                else:
+                    # Original behavior: write to batch file only
+                    with open(batch_test_output_path, 'w', encoding='utf-8') as f:
+                        f.write(code)
+                    # Run the batch test file
+                    test_run_results = self.java_test_runner.run_test(batch_test_output_path)
+                
                 compilation_errors = test_run_results['detailed_errors'].get('compilation_errors', [])
                 test_failures = test_run_results['detailed_errors'].get('test_failures', [])
                 tests_run_zero = False
@@ -1022,11 +1063,55 @@ Instructions:
                     if error_block:
                         error_feedback += '\n\n--- ERROR BLOCK AFTER [INFO] Results: ---\n' + error_block + '\n--- END ERROR BLOCK ---\n'
                     retries += 1
-            # Always update final_code with the latest test file after each batch
-            with open(batch_test_output_path, 'r', encoding='utf-8') as f:
-                final_code = f.read()
+            # Update final_code based on merging mode
+            if ENABLE_INCREMENTAL_MERGE and merged_test_class:
+                final_code = merged_test_class
+            else:
+                # Fallback to reading the last batch file
+                with open(batch_test_output_path, 'r', encoding='utf-8') as f:
+                    final_code = f.read()
         # After all batches:
         return final_code
+
+    def merge_batch_with_existing_test_class(
+        self, 
+        existing_test_class: str, 
+        new_batch_code: str, 
+        target_class_name: str,
+        target_package_name: str,
+        test_type: str
+    ) -> str:
+        """
+        LLM-powered merge of new batch into existing test class.
+        Returns the merged test class code.
+        """
+        merge_prompt = f"""
+You are an expert Java test developer. Merge the new test methods into the existing test class.
+
+EXISTING TEST CLASS:
+{existing_test_class}
+
+NEW BATCH TO ADD:
+{new_batch_code}
+
+REQUIREMENTS:
+- Keep all existing imports, fields, and methods from the existing test class
+- Add new test methods from the batch
+- Ensure @InjectMocks field names are consistent (use 'sut' as canonical name)
+- Deduplicate any duplicate imports
+- Maintain proper class structure and annotations
+- Keep all existing @BeforeEach/@AfterEach methods
+- If test method names conflict, rename new ones with _BatchN suffix
+- Preserve the original package: {target_package_name} (NOT {target_package_name}.{target_class_name}Test)
+- Maintain test type consistency: {test_type} (controller/service)
+- Ensure the package declaration is: package {target_package_name};
+
+Output ONLY the complete merged test class, no explanations or markdown.
+"""
+        result = self.llm.invoke(merge_prompt)
+        if hasattr(result, "content"):
+            result = result.content
+        return result.strip()
 
     def extract_public_methods(self, class_code: str) -> set:
         """
