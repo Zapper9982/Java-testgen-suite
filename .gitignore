@@ -8,3 +8,4 @@ src/test/*
 llm/__pycache__
 /analysis_results/
 *.pyc
+.DS_Store
