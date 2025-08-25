@@ -29,7 +29,9 @@ REQUIREMENTS:
 - Maintain test type consistency: {test_type} (controller/service)
 - Ensure the package declaration is: package {target_package_name};
 
-Output ONLY the complete merged test class, no explanations or markdown.
+CRITICAL: Output ONLY the complete merged test class as plain Java code. 
+DO NOT use markdown formatting, code blocks, backticks, or any explanations.
+Start directly with the package declaration and end with the closing brace of the class.
 """
     
     return merge_prompt

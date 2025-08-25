@@ -720,10 +720,60 @@ class TestCaseGenerator:
             test_type=test_type
         )
         
-        result = self.llm.invoke(merge_prompt)
-        if hasattr(result, "content"):
-            result = result.content
-        return result.strip()
+        # Add retry logic for API failures
+        max_merge_retries = 3
+        for attempt in range(max_merge_retries):
+            try:
+                print(f"[MERGE] Attempt {attempt + 1}/{max_merge_retries} to merge batch...")
+                result = self.llm.invoke(merge_prompt)
+                if hasattr(result, "content"):
+                    result = result.content
+                
+                # Debug: Show raw LLM response before cleaning
+                print(f"[MERGE][DEBUG] Raw LLM response (first 200 chars): {result[:200]}")
+                if result.startswith('```'):
+                    print("[MERGE][DEBUG] WARNING: LLM response starts with backticks - will clean them up")
+                
+                # Clean up markdown code block backticks (same as in batch generation)
+                merged_code = result.strip()
+                merged_code = re.sub(r'^```[a-zA-Z]*\n', '', merged_code)
+                merged_code = re.sub(r'^```', '', merged_code)
+                merged_code = re.sub(r'```$', '', merged_code)
+                merged_code = merged_code.strip()
+                
+                # Debug: Show cleaned response
+                print(f"[MERGE][DEBUG] Cleaned response (first 200 chars): {merged_code[:200]}")
+                
+                # Check if we got a valid response
+                if merged_code and len(merged_code) > 50:  # Basic sanity check
+                    print(f"[MERGE] Successfully merged on attempt {attempt + 1}")
+                    return merged_code
+                else:
+                    print(f"[MERGE][WARNING] Got empty or too short response on attempt {attempt + 1}")
+                    if attempt == max_merge_retries - 1:
+                        print("[MERGE][ERROR] All merge attempts failed - returning original code")
+                        return existing_test_class  # Fallback to existing code
+                    
+            except Exception as e:
+                print(f"[MERGE][ERROR] Attempt {attempt + 1} failed with error: {e}")
+                if "InternalServerError" in str(e) or "500" in str(e):
+                    print("[MERGE] Google API internal server error - will retry...")
+                    if attempt < max_merge_retries - 1:
+                        import time
+                        wait_time = (attempt + 1) * 2  # Exponential backoff
+                        print(f"[MERGE] Waiting {wait_time} seconds before retry...")
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        print("[MERGE][ERROR] Max retries reached - returning existing test class")
+                        return existing_test_class
+                else:
+                    # Non-retryable error
+                    print(f"[MERGE][ERROR] Non-retryable error: {e}")
+                    return existing_test_class
+        
+        # Should not reach here, but just in case
+        return existing_test_class
 
     def _fix_class_name_for_merged_file(self, batch_code: str, target_class_name: str) -> str:
         """
