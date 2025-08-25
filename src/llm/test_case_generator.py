@@ -565,12 +565,8 @@ class TestCaseGenerator:
             # Update package name to reflect the new folder structure
             batch_package_name = target_package_name  # Use original package name, not with Test suffix
             
-            # Create a folder for this class's test batches
-            class_test_folder = test_output_file_path.parent / f"{target_class_name}Test"
-            class_test_folder.mkdir(parents=True, exist_ok=True)
-            
-            # Define the batch test file path
-            batch_test_output_path = class_test_folder / f"{target_class_name}Test_Batch{i+1}.java"
+            # Define the batch test file path in the same directory as the final test file
+            batch_test_output_path = test_output_file_path.parent / f"{target_class_name}Test_Batch{i+1}.java"
             
             print(f"[DEBUG] test_type: {test_type}, batch: {i+1}/{len(batches)}, retry: {retries}")
             while retries < 15 and not success:
@@ -621,9 +617,9 @@ class TestCaseGenerator:
                 # Implement incremental merging logic
                 if ENABLE_INCREMENTAL_MERGE:
                     if i == 0:
-                        # First batch: initialize merged test class
-                        merged_test_class = code
-                        print(f"[MERGE] Initialized merged test class for {target_class_name}")
+                        # First batch: initialize merged test class with correct class name
+                        merged_test_class = self._fix_class_name_for_merged_file(code, target_class_name)
+                        print(f"[MERGE] Initialized merged test class for {target_class_name} with correct class name")
                     else:
                         # Subsequent batches: LLM merge
                         print(f"[MERGE] Merging batch {i+1} into existing test class...")
@@ -637,6 +633,10 @@ class TestCaseGenerator:
                             # Fallback: keep batch separate
                             merged_test_class = code
                     
+                    # Ensure directories exist before writing files
+                    merged_test_file_path.parent.mkdir(parents=True, exist_ok=True)
+                    batch_test_output_path.parent.mkdir(parents=True, exist_ok=True)
+                    
                     # Write merged class to final file
                     with open(merged_test_file_path, 'w', encoding='utf-8') as f:
                         f.write(merged_test_class)
@@ -649,6 +649,8 @@ class TestCaseGenerator:
                     test_run_results = self.java_test_runner.run_test(merged_test_file_path)
                 else:
                     # Original behavior: write to batch file only
+                    # Ensure directory exists before writing file
+                    batch_test_output_path.parent.mkdir(parents=True, exist_ok=True)
                     with open(batch_test_output_path, 'w', encoding='utf-8') as f:
                         f.write(code)
                     # Run the batch test file
@@ -722,6 +724,29 @@ class TestCaseGenerator:
         if hasattr(result, "content"):
             result = result.content
         return result.strip()
+
+    def _fix_class_name_for_merged_file(self, batch_code: str, target_class_name: str) -> str:
+        """
+        Fix the class name in batch code to be the final merged class name (without Batch suffix).
+        Changes UserServiceTest_Batch1 to UserServiceTest.
+        """
+        import re
+        
+        # Pattern to match class declaration with Batch suffix
+        class_pattern = rf'class\s+{re.escape(target_class_name)}Test_Batch\d+'
+        
+        # Find the original class name for logging
+        original_match = re.search(class_pattern, batch_code)
+        if original_match:
+            original_class_name = original_match.group()
+            print(f"[CLASS_NAME_FIX] Changing class name from '{original_class_name}' to '{target_class_name}Test'")
+        else:
+            print(f"[CLASS_NAME_FIX] No batch class name found to replace in code")
+        
+        # Replace with the final class name
+        fixed_code = re.sub(class_pattern, f'class {target_class_name}Test', batch_code)
+        
+        return fixed_code
 
     def extract_public_methods(self, class_code: str) -> set:
         """
