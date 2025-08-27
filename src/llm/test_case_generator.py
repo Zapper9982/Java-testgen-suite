@@ -62,7 +62,7 @@ if not GOOGLE_API_KEY:
     print("WARNING: GOOGLE_API_KEY environment variable not set. Please set it for Gemini API calls.")
     print("Example: export GOOGLE_API_KEY='your_google_api_key_here'")
 
-# LLM model definition - Using Gemini 1.5 Flash for potentially better rate limits and speed
+
 LLM_MODEL_NAME_GEMINI = "gemini-2.5-pro" 
 
 EMBEDDING_MODEL_NAME_BGE = "BAAI/bge-small-en-v1.5"
@@ -669,6 +669,14 @@ class TestCaseGenerator:
                 if not compilation_errors and not test_failures and not tests_run_zero:
                     print(f"[SUCCESS] Batch {i+1}/{len(batches)}: No compilation or test errors.")
                     success = True
+                    
+                    # Clean up batch file after successful generation and merge
+                    try:
+                        if batch_test_output_path.exists():
+                            batch_test_output_path.unlink()  # Delete the batch file
+                            print(f"[CLEANUP] Deleted temporary batch file: {batch_test_output_path.name}")
+                    except Exception as cleanup_error:
+                        print(f"[CLEANUP][WARNING] Failed to delete batch file {batch_test_output_path}: {cleanup_error}")
                 else:
                     error_msgs = []
                     if compilation_errors:
