@@ -11,10 +11,6 @@ import traceback
 import subprocess
 
 
-
-
-# Assuming the script is located within the project, e.g., 'your_project_root/src/your_module/script.py'
-# TESTGEN_AUTOMATION_ROOT will be 'your_project_root/'
 TESTGEN_AUTOMATION_ROOT = Path(__file__).parent.parent.parent
 
 # --- Read Spring Boot project root from environment variable ---
@@ -63,7 +59,7 @@ if not GOOGLE_API_KEY:
     print("Example: export GOOGLE_API_KEY='your_google_api_key_here'")
 
 
-LLM_MODEL_NAME_GEMINI = "gemini-2.5-pro" 
+LLM_MODEL_NAME_GEMINI = "gemini-2.5-flash" 
 
 EMBEDDING_MODEL_NAME_BGE = "BAAI/bge-small-en-v1.5"
 # Use 'mps' for Apple Silicon (M1/M2/M3 chips) if available, otherwise 'cpu'
@@ -565,19 +561,25 @@ class TestCaseGenerator:
             # Update package name to reflect the new folder structure
             batch_package_name = target_package_name  # Use original package name, not with Test suffix
             
-            # Define the batch test file path in the same directory as the final test file
-            batch_test_output_path = test_output_file_path.parent / f"{target_class_name}Test_Batch{i+1}.java"
+            # Store current batch raw code in memory instead of using batch files
+            current_batch_raw_code = None
+            
+            # Read current main file content before starting this batch (for restoration if needed)
+            main_file_content_before_batch = None
+            if merged_test_file_path.exists():
+                try:
+                    with open(merged_test_file_path, 'r', encoding='utf-8') as f:
+                        main_file_content_before_batch = f.read()
+                except Exception as e:
+                    print(f"[WARNING] Could not read existing main file: {e}")
+                    main_file_content_before_batch = None
             
             print(f"[DEBUG] test_type: {test_type}, batch: {i+1}/{len(batches)}, retry: {retries}")
             while retries < 15 and not success:
                 context = minimal_context  # Use minimal context for every batch
-                previous_test_code = None
-                # Always read the current batch test file for every retry (not just for new batches)
-                try:
-                    with open(batch_test_output_path, 'r', encoding='utf-8') as f:
-                        previous_test_code = f.read()
-                except Exception:
-                    previous_test_code = None
+                
+                # Use stored raw batch code from previous attempt as previous_test_code
+                previous_test_code = current_batch_raw_code  # This is None on first attempt, which is correct
                 
                 # Generate prompt using template functions
                 if test_type == "controller":
@@ -614,6 +616,9 @@ class TestCaseGenerator:
                 code = re.sub(r'```$', '', code)
                 code = code.strip()
                 
+                # Store raw batch code for potential retry use
+                current_batch_raw_code = code
+                
                 # Implement incremental merging logic
                 if ENABLE_INCREMENTAL_MERGE:
                     if i == 0:
@@ -621,40 +626,36 @@ class TestCaseGenerator:
                         merged_test_class = self._fix_class_name_for_merged_file(code, target_class_name)
                         print(f"[MERGE] Initialized merged test class for {target_class_name} with correct class name")
                     else:
-                        # Subsequent batches: LLM merge
+                        # Subsequent batches: LLM merge with existing main file content
                         print(f"[MERGE] Merging batch {i+1} into existing test class...")
                         try:
+                            # Use main file content before this batch as base for merging
+                            base_content = main_file_content_before_batch or merged_test_class
                             merged_test_class = self.merge_batch_with_existing_test_class(
-                                merged_test_class, code, target_class_name, target_package_name, test_type
+                                base_content, code, target_class_name, target_package_name, test_type
                             )
                             print(f"[MERGE] Successfully merged batch {i+1}")
                         except Exception as merge_error:
                             print(f"[MERGE][ERROR] Failed to merge batch {i+1}: {merge_error}")
-                            # Fallback: keep batch separate
-                            merged_test_class = code
+                            # Fallback: use fixed class name version
+                            merged_test_class = self._fix_class_name_for_merged_file(code, target_class_name)
                     
-                    # Ensure directories exist before writing files
+                    # Ensure directory exists before writing main file
                     merged_test_file_path.parent.mkdir(parents=True, exist_ok=True)
-                    batch_test_output_path.parent.mkdir(parents=True, exist_ok=True)
                     
-                    # Write merged class to final file
+                    # Write merged class to main file only (no batch file)
                     with open(merged_test_file_path, 'w', encoding='utf-8') as f:
                         f.write(merged_test_class)
                     
-                    # Also write to batch file for debugging
-                    with open(batch_test_output_path, 'w', encoding='utf-8') as f:
-                        f.write(code)
-                    
-                    # Run tests on merged file (not batch file)
+                    # Run tests on main file
                     test_run_results = self.java_test_runner.run_test(merged_test_file_path)
                 else:
-                    # Original behavior: write to batch file only
-                    # Ensure directory exists before writing file
-                    batch_test_output_path.parent.mkdir(parents=True, exist_ok=True)
-                    with open(batch_test_output_path, 'w', encoding='utf-8') as f:
+                    # Fallback: ENABLE_INCREMENTAL_MERGE is False - still write to main file only
+                    merged_test_file_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(merged_test_file_path, 'w', encoding='utf-8') as f:
                         f.write(code)
-                    # Run the batch test file
-                    test_run_results = self.java_test_runner.run_test(batch_test_output_path)
+                    # Run tests on main file
+                    test_run_results = self.java_test_runner.run_test(merged_test_file_path)
                 
                 compilation_errors = test_run_results['detailed_errors'].get('compilation_errors', [])
                 test_failures = test_run_results['detailed_errors'].get('test_failures', [])
@@ -669,14 +670,8 @@ class TestCaseGenerator:
                 if not compilation_errors and not test_failures and not tests_run_zero:
                     print(f"[SUCCESS] Batch {i+1}/{len(batches)}: No compilation or test errors.")
                     success = True
-                    
-                    # Clean up batch file after successful generation and merge
-                    try:
-                        if batch_test_output_path.exists():
-                            batch_test_output_path.unlink()  # Delete the batch file
-                            print(f"[CLEANUP] Deleted temporary batch file: {batch_test_output_path.name}")
-                    except Exception as cleanup_error:
-                        print(f"[CLEANUP][WARNING] Failed to delete batch file {batch_test_output_path}: {cleanup_error}")
+                    # Update main file content for next batch
+                    main_file_content_before_batch = merged_test_class if ENABLE_INCREMENTAL_MERGE else code
                 else:
                     error_msgs = []
                     if compilation_errors:
@@ -702,9 +697,13 @@ class TestCaseGenerator:
             if ENABLE_INCREMENTAL_MERGE and merged_test_class:
                 final_code = merged_test_class
             else:
-                # Fallback to reading the last batch file
-                with open(batch_test_output_path, 'r', encoding='utf-8') as f:
-                    final_code = f.read()
+                # Fallback to reading the main file
+                try:
+                    with open(merged_test_file_path, 'r', encoding='utf-8') as f:
+                        final_code = f.read()
+                except Exception as e:
+                    print(f"[ERROR] Could not read final main file: {e}")
+                    final_code = current_batch_raw_code or "// Failed to generate test code"
         # After all batches:
         return final_code
 
