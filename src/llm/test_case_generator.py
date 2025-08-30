@@ -40,26 +40,22 @@ from test_runner.java_test_runner import JavaTestRunner
 from chroma_db.chroma_client import get_chroma_client, get_or_create_collection
 from langchain_community.vectorstores import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_google_genai import ChatGoogleGenerativeAI
 
 import torch 
 from chroma_db.chroma_client import get_chroma_client as get_chroma_client_examples, get_or_create_collection as get_or_create_collection_examples
-# Import new batch prompt templates
+# Import new LLM factory
+from llm.llm_factory import create_llm, LLMFactory
+
+# Import batch prompt templates
 from llm.prompt_templates import (
     get_controller_batch_prompt,
     get_service_batch_prompt,
     get_merge_prompt
 )
 
-
-# --- Google API Configuration ---
+# Legacy support - will be removed in future versions
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") 
-if not GOOGLE_API_KEY:
-    print("WARNING: GOOGLE_API_KEY environment variable not set. Please set it for Gemini API calls.")
-    print("Example: export GOOGLE_API_KEY='your_google_api_key_here'")
-
-
-LLM_MODEL_NAME_GEMINI = "gemini-2.5-flash" 
+LLM_MODEL_NAME_GEMINI = os.getenv("LLM_MODEL_NAME", "gemini-2.5-flash") 
 
 EMBEDDING_MODEL_NAME_BGE = "BAAI/bge-small-en-v1.5"
 # Use 'mps' for Apple Silicon (M1/M2/M3 chips) if available, otherwise 'cpu'
@@ -178,12 +174,15 @@ class TestCaseGenerator:
             embedding_function=self.embeddings
         )
 
-    def _instantiate_llm(self) -> ChatGoogleGenerativeAI:
-        if not GOOGLE_API_KEY:
-            raise ValueError("GOOGLE_API_KEY environment variable is not set. Cannot initialize Gemini LLM.")
-        
-        print(f"Using Google Gemini LLM: {LLM_MODEL_NAME_GEMINI}...")
-        return ChatGoogleGenerativeAI(model=LLM_MODEL_NAME_GEMINI, temperature=0.1)
+    def _instantiate_llm(self):
+        """Instantiate LLM using the factory pattern"""
+        try:
+            return create_llm()
+        except Exception as e:
+            print(f"❌ Failed to create LLM: {e}")
+            print("\n💡 Need help with LLM configuration?")
+            LLMFactory.print_configuration_help()
+            raise
 
     def _update_retriever_filter(self, main_class_filename: str, dependency_filenames: List[str], utility_filenames: List[str] = None, k_override: int = None):
         """
