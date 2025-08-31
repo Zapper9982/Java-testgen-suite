@@ -10,30 +10,49 @@ import javalang
 import traceback
 import subprocess
 
-
+#------------------------------ variable definition section ----------------------------------------
 TESTGEN_AUTOMATION_ROOT = Path(__file__).parent.parent.parent
 
-# --- Read Spring Boot project root from environment variable ---
 SPRING_BOOT_PROJECT_ROOT_ENV = os.getenv("SPRING_BOOT_PROJECT_PATH")
 if not SPRING_BOOT_PROJECT_ROOT_ENV:
     print("ERROR: SPRING_BOOT_PROJECT_PATH environment variable is not set.")
     print("Please set it in your run.sh script or before running test_case_generator.py.")
     sys.exit(1)
 SPRING_BOOT_PROJECT_ROOT = Path(SPRING_BOOT_PROJECT_ROOT_ENV)
-SPRING_BOOT_MAIN_JAVA_DIR = SPRING_BOOT_PROJECT_ROOT / "src" / "main" / "java" # Still define this if needed elsewhere
+SPRING_BOOT_MAIN_JAVA_DIR = SPRING_BOOT_PROJECT_ROOT / "src" / "main" / "java" 
 
-# The 'processed_output' directory is assumed to be directly under TESTGEN_AUTOMATION_ROOT
 PROCESSED_OUTPUT_ROOT = TESTGEN_AUTOMATION_ROOT / "processed_output" 
 
-# Add the 'src' directory of testgen-automation to sys.path
-# This makes modules directly under 'src' (like analyzer/code_analysis_utils.py, test_runner/java_test_runner.py) discoverable
-# by using absolute imports like 'from analyzer.code_analysis_utils import ...'
 TESTGEN_AUTOMATION_SRC_DIR = TESTGEN_AUTOMATION_ROOT / "src"
 if str(TESTGEN_AUTOMATION_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(TESTGEN_AUTOMATION_SRC_DIR))
     print(f"Added {TESTGEN_AUTOMATION_SRC_DIR} to sys.path for internal module imports.")
 
-# Import necessary utilities and the new JavaTestRunner
+
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") 
+LLM_MODEL_NAME_GEMINI = os.getenv("LLM_MODEL_NAME", "gemini-2.5-flash") 
+
+EMBEDDING_MODEL_NAME_BGE = "BAAI/bge-small-en-v1.5"
+
+if torch.backends.mps.is_available():
+    DEVICE_FOR_EMBEDDINGS = "mps"
+    print("Detected Apple Silicon (M1/M2/M3). Using 'mps' device for embeddings.")
+else:
+    DEVICE_FOR_EMBEDDINGS = "cpu"
+    print("Apple Silicon MPS not available or detected. Falling back to 'cpu' for embeddings.")
+
+
+ANALYSIS_RESULTS_DIR = TESTGEN_AUTOMATION_ROOT / "analysis_results"
+ANALYSIS_RESULTS_FILE = ANALYSIS_RESULTS_DIR / "spring_boot_targets.json"
+
+
+MAX_TEST_GENERATION_RETRIES = 15
+
+# ---------------------------------------end of variables section -------------------------------------
+
+
+
+
 from analyzer.code_analysis_utils import extract_custom_imports_from_chunk_file, resolve_transitive_dependencies, resolve_dependency_path, build_global_class_map
 from test_runner.java_test_runner import JavaTestRunner 
 
@@ -43,35 +62,17 @@ from langchain_huggingface import HuggingFaceEmbeddings
 
 import torch 
 from chroma_db.chroma_client import get_chroma_client as get_chroma_client_examples, get_or_create_collection as get_or_create_collection_examples
-# Import new LLM factory
+
 from llm.llm_factory import create_llm, LLMFactory
 
-# Import batch prompt templates
+
 from llm.prompt_templates import (
     get_controller_batch_prompt,
     get_service_batch_prompt,
     get_merge_prompt
 )
 
-# Legacy support - will be removed in future versions
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") 
-LLM_MODEL_NAME_GEMINI = os.getenv("LLM_MODEL_NAME", "gemini-2.5-flash") 
 
-EMBEDDING_MODEL_NAME_BGE = "BAAI/bge-small-en-v1.5"
-# Use 'mps' for Apple Silicon (M1/M2/M3 chips) if available, otherwise 'cpu'
-if torch.backends.mps.is_available():
-    DEVICE_FOR_EMBEDDINGS = "mps"
-    print("Detected Apple Silicon (M1/M2/M3). Using 'mps' device for embeddings.")
-else:
-    DEVICE_FOR_EMBEDDINGS = "cpu"
-    print("Apple Silicon MPS not available or detected. Falling back to 'cpu' for embeddings.")
-
-# Define the expected location of the pre-analyzed Spring Boot targets JSON file
-ANALYSIS_RESULTS_DIR = TESTGEN_AUTOMATION_ROOT / "analysis_results"
-ANALYSIS_RESULTS_FILE = ANALYSIS_RESULTS_DIR / "spring_boot_targets.json"
-
-# Max retries for test generation + fixing
-MAX_TEST_GENERATION_RETRIES = 15
 
 # --- Token Estimation Utility ---
 def estimate_token_count(text: str) -> int:
