@@ -9,6 +9,7 @@ load_dotenv()
 import javalang
 import traceback
 import subprocess
+import torch 
 
 #------------------------------ variable definition section ----------------------------------------
 TESTGEN_AUTOMATION_ROOT = Path(__file__).parent.parent.parent
@@ -60,7 +61,7 @@ from chroma_db.chroma_client import get_chroma_client, get_or_create_collection
 from langchain_community.vectorstores import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
 
-import torch 
+
 from chroma_db.chroma_client import get_chroma_client as get_chroma_client_examples, get_or_create_collection as get_or_create_collection_examples
 
 from llm.llm_factory import create_llm, LLMFactory
