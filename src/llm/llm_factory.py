@@ -131,7 +131,6 @@ class LLMFactory:
         return ChatGoogleGenerativeAI(**params)
     
     @staticmethod
-    @staticmethod  
     def _create_openai_llm(config: LLMConfig) -> ChatOpenAI:
         """Create OpenAI GPT LLM instance"""
         if ChatOpenAI is None:
@@ -157,7 +156,6 @@ class LLMFactory:
             
         return ChatOpenAI(**params)
     
-    @staticmethod
     @staticmethod
     def _create_anthropic_llm(config: LLMConfig) -> ChatAnthropic:
         """Create Anthropic Claude LLM instance"""
@@ -185,7 +183,6 @@ class LLMFactory:
         return ChatAnthropic(**params)
     
     @staticmethod
-    @staticmethod
     def _create_ollama_llm(config: LLMConfig) -> ChatOllama:
         """Create Ollama local LLM instance"""
         if ChatOllama is None:
@@ -211,7 +208,6 @@ class LLMFactory:
                 
         return ChatOllama(**params)
     
-    @staticmethod
     @staticmethod
     def _create_azure_openai_llm(config: LLMConfig) -> AzureChatOpenAI:
         """Create Azure OpenAI LLM instance"""
