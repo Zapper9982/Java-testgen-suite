@@ -75,52 +75,33 @@ from llm.prompt_templates import (
 
 
 
-# --- Token Estimation Utility ---
+
 def estimate_token_count(text: str) -> int:
-    """
-    Roughly estimate the number of tokens for Gemini (1 token ≈ 4 characters).
-    """
     return len(text) // 4
 
-MAX_TOTAL_TOKENS = 45000  # Stay below 50K for safety
-MIN_K = 3  # Minimum number of context chunks
+MAX_TOTAL_TOKENS = 45000  
+MIN_K = 3  
 
-# Control incremental merging behavior
 ENABLE_INCREMENTAL_MERGE = os.getenv("ENABLE_INCREMENTAL_MERGE", "true").strip().lower() in {"1", "true", "yes", "y"}
 KEEP_BATCH_FILES_ON_MERGE_FAILURE = os.getenv("KEEP_BATCH_FILES_ON_MERGE_FAILURE", "true").strip().lower() in {"1", "true", "yes", "y"}
 
 def get_test_paths(relative_filepath_from_processed_output: str, project_root: Path):
-    """
-    Generates the expected output paths for the test file based on the path
-    relative to the 'processed_output' directory.
 
-    Args:
-        relative_filepath_from_processed_output: Path string like "com/package/file.txt"
-                                                 which is relative to PROCESSED_OUTPUT_ROOT.
-        project_root: The root directory of the Spring Boot project.
 
-    Returns:
-        A dictionary containing various path components.
-    """
-    # Create a Path object from the relative string
     relative_path_obj = Path(relative_filepath_from_processed_output)
 
-    # 1. Get the package path (directory part)
+
     package_path = relative_path_obj.parent
 
-    # 2. Get the original filename base (without .txt or .java)
     original_filename_base = relative_path_obj.stem 
 
-    # 3. Construct the original .java filename (e.g., "MyService.java")
+
     original_java_filename = f"{original_filename_base}.java" 
 
-    # 4. Construct the test class name (e.g., "MyServiceTest.java")
     test_class_name = f"{original_filename_base}Test.java"
 
-    # 5. Construct the full output directory for the test file
     test_output_dir = project_root / "src" / "test" / "java" / package_path
 
-    # 6. Construct the full output file path
     test_output_file_path = test_output_dir / test_class_name
 
     return {
@@ -148,7 +129,7 @@ class TestCaseGenerator:
             collection_name=collection_name,
             embedding_function=self.embeddings 
         )
-        # Initialize retriever with a default k. It will be updated dynamically later.
+     
         self.retriever = self.vectorstore.as_retriever(
             search_type="mmr", 
             search_kwargs={"k": 15},
@@ -156,18 +137,17 @@ class TestCaseGenerator:
         print("ChromaDB retriever instantiated (default settings).")
 
         self.llm = self._instantiate_llm()
-        print("Google Gemini LLM instantiated for LangChain.")
+        print(" LLM instantiated for LangChain.")
 
-        # QA chain will be initialized/updated dynamically in generate_test_case
         self.qa_chain = None 
 
         project_root_from_env = os.getenv("SPRING_BOOT_PROJECT_PATH")
         if not project_root_from_env:
             raise ValueError("SPRING_BOOT_PROJECT_PATH environment variable is not set. Cannot initialize JavaTestRunner.")
         self.java_test_runner = JavaTestRunner(project_root=Path(project_root_from_env), build_tool=build_tool)
-        self.last_test_run_results = None # Initialize to store feedback
+        self.last_test_run_results = None 
 
-        # --- RAG: Setup for test example retrieval ---
+
         self.test_examples_collection_name = "test_examples_collection"
         self.test_examples_chroma_client = get_chroma_client_examples()
         self.test_examples_vectorstore = Chroma(
@@ -177,7 +157,7 @@ class TestCaseGenerator:
         )
 
     def _instantiate_llm(self):
-        """Instantiate LLM using the factory pattern"""
+    
         try:
             return create_llm()
         except Exception as e:
@@ -187,18 +167,14 @@ class TestCaseGenerator:
             raise
 
     def _update_retriever_filter(self, main_class_filename: str, dependency_filenames: List[str], utility_filenames: List[str] = None, k_override: int = None):
-        """
-        Updates the retriever's filter to target only the main class, its direct dependencies, and utility files if actually imported.
-        Orders context as: main class, dependencies, utility files.
-        Sets a lower default k for focused retrieval.
-        """
+
         filter_filenames = [main_class_filename] + dependency_filenames
         if utility_filenames:
             filter_filenames += utility_filenames
-        # Remove duplicates while preserving order
+      
         seen = set()
         filter_filenames = [x for x in filter_filenames if not (x in seen or seen.add(x))]
-        # Set a lower k for focused context
+      
         k = min(5, len(filter_filenames))
         if k_override is not None:
             k = max(MIN_K, k_override)
@@ -221,7 +197,7 @@ class TestCaseGenerator:
             return 'service'
         elif 'repository' in ttype:
             return 'repository'
-        return 'service'  # Default fallback
+        return 'service'  
 
     def _get_prompt_template(self, test_type: str, target_class_name: str, target_package_name: str, custom_imports: list, additional_query_instructions: str, dependency_signatures: dict = None) -> str:
         if test_type == 'controller':
@@ -242,9 +218,7 @@ class TestCaseGenerator:
 
 
     def _get_direct_local_imports(self, class_code: str, project_root: Path) -> list:
-        """
-        Parse import statements from the class code and return a list of local Java filenames (e.g., 'UserAgentUtil.java') that are directly imported and start with 'com.iemr.'
-        """
+
         import_pattern = re.compile(r'^import\s+(com\.iemr\.[\w\.]+);', re.MULTILINE)
         local_files = set()
         for match in import_pattern.finditer(class_code):
@@ -288,7 +262,7 @@ class TestCaseGenerator:
             dep_code = self._get_full_code_from_chromadb(dep)
             dep_code = strip_java_comments_and_trailing_whitespace(dep_code)
             context += f"--- BEGIN DEPENDENCY: {dep} ---\n{dep_code}\n--- END DEPENDENCY: {dep} ---\n\n"
-        # Now, use 'context' in the prompt
+      
         public_methods = extract_public_methods(target_info['java_file_path_abs'])
         test_type = self._detect_test_type(target_info) if target_info else None
         if test_type is None:
@@ -297,7 +271,7 @@ class TestCaseGenerator:
             prompt_template = get_controller_test_prompt_template(
                 target_class_name, target_package_name, custom_imports, additional_query_instructions
             )
-            # Add strict instruction to not generate code for dependencies
+           
             prompt_template += "\nSTRICT: Do NOT generate any code for dependencies. Only generate the test class for the controller. Assume all dependencies exist and are available for mocking.\n"
         else:
             prompt_template = get_service_test_prompt_template(
@@ -318,7 +292,7 @@ class TestCaseGenerator:
             code = re.sub(r'^```', '', code)
             code = re.sub(r'```$', '', code)
             code = code.strip()
-            # Write to file
+   
             test_output_file_path.parent.mkdir(parents=True, exist_ok=True)
             with open(test_output_file_path, 'w', encoding='utf-8') as f:
                 f.write(code)
@@ -400,7 +374,7 @@ class TestCaseGenerator:
         if test_type is None:
             test_type = 'service'  # fallback
         full_context = f"--- BEGIN MAIN CLASS UNDER TEST ---\n"
-        # Use the full .java file for the main class code
+        
         with open(target_info['java_file_path_abs'], 'r', encoding='utf-8') as f:
             main_code = f.read()
         main_code = strip_java_comments_and_trailing_whitespace(main_code)
@@ -418,10 +392,10 @@ class TestCaseGenerator:
                     dep_signatures = f"// Dependency not found: {dep}"
                 dep_signatures = strip_java_comments_and_trailing_whitespace(dep_signatures)
                 full_context += f"--- BEGIN DEPENDENCY SIGNATURES: {dep} ---\n{dep_signatures}\n--- END DEPENDENCY SIGNATURES: {dep} ---\n\n"
-        # Extract public methods and endpoint map from the main class code only (not from full_context)
+  
         with open(target_info['java_file_path_abs'], 'r', encoding='utf-8') as f:
             main_class_code = f.read()
-        # Use javalang to extract both public methods and endpoint paths
+     
         public_methods = set()
         endpoint_map = {}
         try:
@@ -435,7 +409,7 @@ class TestCaseGenerator:
                 for method in main_class.methods:
                     if 'public' in method.modifiers:
                         public_methods.add(method.name)
-                        # Look for REST endpoint annotations
+                      
                         endpoint = None
                         if method.annotations:
                             for ann in method.annotations:
@@ -443,9 +417,9 @@ class TestCaseGenerator:
                                 if ann_name in [
                                     'getmapping', 'postmapping', 'putmapping', 'deletemapping', 'patchmapping', 'requestmapping'
                                 ]:
-                                    # Try to extract the path value
+                                  
                                     if ann.element:
-                                        # Handles @GetMapping(path = "/foo") or @GetMapping("/foo")
+                                      
                                         if hasattr(ann.element, 'value') and ann.element.value:
                                             endpoint = ann.element.value.value if hasattr(ann.element.value, 'value') else str(ann.element.value)
                                         elif hasattr(ann.element, 'pairs') and ann.element.pairs:
@@ -467,18 +441,16 @@ class TestCaseGenerator:
         
         # Initialize incremental merging variables
         merged_test_class = None
-        merged_test_file_path = test_output_file_path  # The final merged file
+        merged_test_file_path = test_output_file_path 
         
         final_code = None
         for i, batch in enumerate(batches):
-            # --- ADDED: Check for batch method name mismatches ---
             batch_set = set(batch)
             public_methods_set = set(public_methods)
             if not batch_set.issubset(public_methods_set):
                 missing = batch_set - public_methods_set
                 print(f"[WARNING] Batch {i+1} contains method names not in extracted public methods: {missing}")
             print(f"\n[INFO] Generating test case for batch {i+1}/{len(batches)} with these public methods: {batch}\n")
-            # Build endpoints list for this batch (force-apply fix)
             endpoints_list = []
             for m in batch:
                 if m in endpoint_map:
@@ -486,14 +458,14 @@ class TestCaseGenerator:
             endpoints_list_str = '\n'.join(endpoints_list)
             print(f"[BATCH MODE] Generating tests for methods: {batch}")
             method_list_str = '\n'.join(f'- {m}' for m in batch)
-            retries = 0  # Always define retries at the start of the batch
+            retries = 0  
             success = False
             error_feedback = None
-            # --- NEW: Use minimal class code for batch ---
+
             with open(target_info['java_file_path_abs'], 'r', encoding='utf-8') as f:
                 main_code = f.read()
             main_code = strip_java_comments_and_trailing_whitespace(main_code)
-            # Extract import statements
+
             import_lines = [line for line in main_code.splitlines() if line.strip().startswith('import ')]
             imports_section = ''
             if import_lines:
@@ -504,31 +476,31 @@ class TestCaseGenerator:
             except Exception as e:
                 print(f"[ERROR] Failed to extract minimal class code for batch {i+1}: {e}")
                 traceback.print_exc()
-                minimal_class_code = main_code  # fallback
-            # --- PATCH: Only include dependency signatures for types referenced in minimal class ---
+                minimal_class_code = main_code 
+
             referenced_types = extract_referenced_types(target_info['java_file_path_abs'], batch)
             dep_signatures = []
             included_deps = []
             
-            # Extract types that are actually used in the minimal class code
+       
             minimal_class_types = set()
             if minimal_class_code:
-                # Look for field declarations and method calls in the minimal class
+  
                 lines = minimal_class_code.split('\n')
                 for line in lines:
                     line = line.strip()
-                    # Look for field declarations like: private SomeType fieldName;
+           
                     if line.startswith('private ') or line.startswith('@Autowired private ') or line.startswith('@PersistenceContext private '):
                         parts = line.split()
                         if len(parts) >= 3:
-                            # Handle @Autowired private SomeType fieldName;
+       
                             if line.startswith('@Autowired private '):
-                                type_name = parts[2]  # The type name after @Autowired private
+                                type_name = parts[2]  
                             else:
-                                type_name = parts[1]  # The type name after private
+                                type_name = parts[1] 
                             if type_name and not type_name.startswith('static') and not type_name.startswith('final'):
                                 minimal_class_types.add(type_name)
-                    # Look for method calls like: someType.method()
+                 
                     elif '.' in line and '(' in line:
                         parts = line.split('.')
                         if len(parts) >= 2:
@@ -539,8 +511,7 @@ class TestCaseGenerator:
                                     if ref_type.lower().endswith(field_name.lower()) or field_name.lower() in ref_type.lower():
                                         minimal_class_types.add(ref_type)
                                         break
-            
-            # Only include dependency signatures for types actually used in minimal class
+
             for dep_type in referenced_types:
                 if dep_type in minimal_class_types:
                     dep_path = resolve_dependency_path(dep_type + '.java', main_code, SPRING_BOOT_MAIN_JAVA_DIR)
@@ -558,14 +529,12 @@ class TestCaseGenerator:
             minimal_context += "\n".join(dep_signatures)
             strict_no_comments = '\nSTRICT: Do NOT add any comments to the generated code. and MAKE SURE that the code is JUNIT5 + MOCKITO STYLE FOR SERVICES\n'
             minimal_context += strict_no_comments
-            
-            # Update package name to reflect the new folder structure
-            batch_package_name = target_package_name  # Use original package name, not with Test suffix
-            
-            # Store current batch raw code in memory instead of using batch files
+      
+            batch_package_name = target_package_name 
+
             current_batch_raw_code = None
             
-            # Read current main file content before starting this batch (for restoration if needed)
+            
             main_file_content_before_batch = None
             if merged_test_file_path.exists():
                 try:
@@ -577,12 +546,11 @@ class TestCaseGenerator:
             
             print(f"[DEBUG] test_type: {test_type}, batch: {i+1}/{len(batches)}, retry: {retries}")
             while retries < 15 and not success:
-                context = minimal_context  # Use minimal context for every batch
+                context = minimal_context 
                 
-                # Use stored raw batch code from previous attempt as previous_test_code
+                
                 previous_test_code = current_batch_raw_code  # This is None on first attempt, which is correct
-                
-                # Generate prompt using template functions
+              
                 if test_type == "controller":
                     prompt = get_controller_batch_prompt(
                         target_class_name=target_class_name,
@@ -604,9 +572,9 @@ class TestCaseGenerator:
                         error_feedback=error_feedback if retries > 0 else None
                     )
                 
-                # Print the prompt for every batch attempt
+      
                 print(f"\n[BATCH {i+1} RETRY {retries}] PROMPT SENT TO LLM:\n" + prompt + "\n[END PROMPT]\n")
-                # Debug print: show minimal class code for this batch
+               
                 print(f"[DEBUG] Minimal class code for batch {i+1}, retry {retries} (methods: {batch}):\n--- BEGIN MINIMAL CLASS CODE ---\n{minimal_class_code}\n--- END MINIMAL CLASS CODE ---\n")
                 result = self.llm.invoke(prompt)
                 if hasattr(result, "content"):
@@ -616,21 +584,20 @@ class TestCaseGenerator:
                 code = re.sub(r'^```', '', code)
                 code = re.sub(r'```$', '', code)
                 code = code.strip()
-                
-                # Store raw batch code for potential retry use
+
                 current_batch_raw_code = code
                 
-                # Implement incremental merging logic
+
                 if ENABLE_INCREMENTAL_MERGE:
                     if i == 0:
-                        # First batch: initialize merged test class with correct class name
+                   
                         merged_test_class = self._fix_class_name_for_merged_file(code, target_class_name)
                         print(f"[MERGE] Initialized merged test class for {target_class_name} with correct class name")
                     else:
-                        # Subsequent batches: LLM merge with existing main file content
+                      
                         print(f"[MERGE] Merging batch {i+1} into existing test class...")
                         try:
-                            # Use main file content before this batch as base for merging
+                          
                             base_content = main_file_content_before_batch or merged_test_class
                             merged_test_class = self.merge_batch_with_existing_test_class(
                                 base_content, code, target_class_name, target_package_name, test_type
@@ -638,24 +605,24 @@ class TestCaseGenerator:
                             print(f"[MERGE] Successfully merged batch {i+1}")
                         except Exception as merge_error:
                             print(f"[MERGE][ERROR] Failed to merge batch {i+1}: {merge_error}")
-                            # Fallback: use fixed class name version
+                          
                             merged_test_class = self._fix_class_name_for_merged_file(code, target_class_name)
                     
-                    # Ensure directory exists before writing main file
+                 
                     merged_test_file_path.parent.mkdir(parents=True, exist_ok=True)
                     
-                    # Write merged class to main file only (no batch file)
+                   
                     with open(merged_test_file_path, 'w', encoding='utf-8') as f:
                         f.write(merged_test_class)
                     
-                    # Run tests on main file
+                 
                     test_run_results = self.java_test_runner.run_test(merged_test_file_path)
                 else:
-                    # Fallback: ENABLE_INCREMENTAL_MERGE is False - still write to main file only
+                  
                     merged_test_file_path.parent.mkdir(parents=True, exist_ok=True)
                     with open(merged_test_file_path, 'w', encoding='utf-8') as f:
                         f.write(code)
-                    # Run tests on main file
+                  
                     test_run_results = self.java_test_runner.run_test(merged_test_file_path)
                 
                 compilation_errors = test_run_results['detailed_errors'].get('compilation_errors', [])
@@ -671,7 +638,7 @@ class TestCaseGenerator:
                 if not compilation_errors and not test_failures and not tests_run_zero:
                     print(f"[SUCCESS] Batch {i+1}/{len(batches)}: No compilation or test errors.")
                     success = True
-                    # Update main file content for next batch
+                   
                     main_file_content_before_batch = merged_test_class if ENABLE_INCREMENTAL_MERGE else code
                 else:
                     error_msgs = []
@@ -728,7 +695,7 @@ class TestCaseGenerator:
             test_type=test_type
         )
         
-        # Add retry logic for API failures
+       
         max_merge_retries = 3
         for attempt in range(max_merge_retries):
             try:
@@ -737,30 +704,30 @@ class TestCaseGenerator:
                 if hasattr(result, "content"):
                     result = result.content
                 
-                # Debug: Show raw LLM response before cleaning
+              
                 print(f"[MERGE][DEBUG] Raw LLM response (first 200 chars): {result[:200]}")
                 if result.startswith('```'):
                     print("[MERGE][DEBUG] WARNING: LLM response starts with backticks - will clean them up")
                 
-                # Clean up markdown code block backticks (same as in batch generation)
+                
                 merged_code = result.strip()
                 merged_code = re.sub(r'^```[a-zA-Z]*\n', '', merged_code)
                 merged_code = re.sub(r'^```', '', merged_code)
                 merged_code = re.sub(r'```$', '', merged_code)
                 merged_code = merged_code.strip()
                 
-                # Debug: Show cleaned response
+          
                 print(f"[MERGE][DEBUG] Cleaned response (first 200 chars): {merged_code[:200]}")
                 
-                # Check if we got a valid response
-                if merged_code and len(merged_code) > 50:  # Basic sanity check
+               
+                if merged_code and len(merged_code) > 50: 
                     print(f"[MERGE] Successfully merged on attempt {attempt + 1}")
                     return merged_code
                 else:
                     print(f"[MERGE][WARNING] Got empty or too short response on attempt {attempt + 1}")
                     if attempt == max_merge_retries - 1:
                         print("[MERGE][ERROR] All merge attempts failed - returning original code")
-                        return existing_test_class  # Fallback to existing code
+                        return existing_test_class  
                     
             except Exception as e:
                 print(f"[MERGE][ERROR] Attempt {attempt + 1} failed with error: {e}")
@@ -768,7 +735,7 @@ class TestCaseGenerator:
                     print("[MERGE] Google API internal server error - will retry...")
                     if attempt < max_merge_retries - 1:
                         import time
-                        wait_time = (attempt + 1) * 2  # Exponential backoff
+                        wait_time = (attempt + 1) * 2 
                         print(f"[MERGE] Waiting {wait_time} seconds before retry...")
                         time.sleep(wait_time)
                         continue
@@ -780,28 +747,24 @@ class TestCaseGenerator:
                     print(f"[MERGE][ERROR] Non-retryable error: {e}")
                     return existing_test_class
         
-        # Should not reach here, but just in case
+       
         return existing_test_class
 
     def _fix_class_name_for_merged_file(self, batch_code: str, target_class_name: str) -> str:
-        """
-        Fix the class name in batch code to be the final merged class name (without Batch suffix).
-        Changes UserServiceTest_Batch1 to UserServiceTest.
-        """
+
         import re
         
-        # Pattern to match class declaration with Batch suffix
+      
         class_pattern = rf'class\s+{re.escape(target_class_name)}Test_Batch\d+'
         
-        # Find the original class name for logging
+       
         original_match = re.search(class_pattern, batch_code)
         if original_match:
             original_class_name = original_match.group()
             print(f"[CLASS_NAME_FIX] Changing class name from '{original_class_name}' to '{target_class_name}Test'")
         else:
             print(f"[CLASS_NAME_FIX] No batch class name found to replace in code")
-        
-        # Replace with the final class name
+      
         fixed_code = re.sub(class_pattern, f'class {target_class_name}Test', batch_code)
         
         return fixed_code
@@ -833,11 +796,7 @@ class TestCaseGenerator:
 
 
     def extract_full_compilation_error(self, stdout: str) -> str:
-        """
-        Extract the full compilation error block from Maven/Gradle output.
-        Returns the block from '[ERROR] COMPILATION ERROR' to the next '[INFO]' or end of error section.
-        If that block is too short, fallback to collecting all lines starting with [ERROR] and the next 2 lines after each for context.
-        """
+       
         error_block = []
         in_error = False
         for line in stdout.splitlines():
@@ -845,10 +804,10 @@ class TestCaseGenerator:
                 in_error = True
             if in_error:
                 error_block.append(line)
-                # End block at next [INFO] (but not the starting line)
+                
                 if '[INFO]' in line and len(error_block) > 1:
                     break
-        # If the block is too short (just header), fallback to all [ERROR] lines and their context
+      
         if len(error_block) <= 2:
             error_block = []
             lines = stdout.splitlines()
@@ -864,7 +823,6 @@ class TestCaseGenerator:
                 i += 1
         return '\n'.join(error_block) if error_block else stdout
 
-# --- Helper: Extract class signatures (public/protected methods, fields, constructors) ---
 def extract_class_signatures(java_code: str, file_path: str = None) -> str:
     """
     Given full Java class code, return a string with only the class declaration and public/protected method/field/constructor signatures.
@@ -946,7 +904,7 @@ def extract_minimal_class_for_methods(java_code: str, method_names: list, file_p
                 class_annos.append(lines[start])
             else:
                 class_annos.append(f"@{anno.name}")
-    # Class declaration line and its index
+  
     class_decl_line = None
     class_decl_idx = None
     for i, line in enumerate(lines):
@@ -968,7 +926,7 @@ def extract_minimal_class_for_methods(java_code: str, method_names: list, file_p
             break
     if class_end_idx is None:
         class_end_idx = len(lines) - 1
-    # Extract all lines inside the class body (excluding methods/constructors)
+ 
     field_lines = []
     inside_method = False
     method_or_ctor_pattern = re.compile(r'\s*(public|private|protected)?\s*[\w<>\[\]]+\s+\w+\s*\([^)]*\)\s*(throws [\w, ]+)?\s*\{')
@@ -1026,7 +984,7 @@ def extract_minimal_class_for_methods(java_code: str, method_names: list, file_p
         )
         header = f"    {mods} {ret_type} {method.name}({params}) "
         return header + "{ ... }"
-    # Find all methods to include: batch + directly called helpers (recursively)
+   
     to_include = set(method_names)
     included = set()
     def add_called_helpers(method):
@@ -1160,12 +1118,10 @@ def extract_referenced_types(java_file_path, method_names):
 
 if __name__ == "__main__":
     try:
-        # User can specify build tool via env var or hardcode it here
+        
         BUILD_TOOL = os.getenv("BUILD_TOOL", "maven").lower() 
         test_generator = TestCaseGenerator(collection_name="code_chunks_collection", build_tool=BUILD_TOOL) 
         
-        # --- Preprocessing/Discovery Phase ---
-        # The data is loaded from the JSON file generated by src/analyzer/code_analyzer.py
         if not ANALYSIS_RESULTS_FILE.exists():
             print(f"ERROR: Analysis results file not found: {ANALYSIS_RESULTS_FILE}")
             print("Please run 'python3 src/analyzer/code_analyzer.py' first to generate analysis data.")
@@ -1181,9 +1137,9 @@ if __name__ == "__main__":
             print("No Spring Boot Service or Controller targets found. Exiting test generation.")
             sys.exit(0) 
 
-        # --- Test Case Generation Phase: Iterate through each discovered target ---
+        
         for target_info in discovered_targets_metadata:
-            # Convert paths back to Path objects as they were stored as strings in JSON
+       
             java_file_path_abs = Path(target_info['java_file_path_abs'])
             relative_processed_txt_path = Path(target_info['relative_processed_txt_path']) 
             target_class_name = target_info['class_name']
@@ -1192,9 +1148,8 @@ if __name__ == "__main__":
             custom_imports_list = target_info['custom_imports'] 
             # NEW: Read the requires_db_test flag from analyzer output
             requires_db_test = target_info.get('requires_db_test', False) 
-            target_class_type = target_info.get('type', 'Unknown') # Get class type (Controller/Service/Repository)
+            target_class_type = target_info.get('type', 'Unknown') 
 
-            # --- NEW: Use transitive dependency resolution ---
             relevant_java_files_for_context = resolve_transitive_dependencies(
                 java_file_path_abs, SPRING_BOOT_MAIN_JAVA_DIR
             )
@@ -1231,7 +1186,7 @@ if __name__ == "__main__":
             print(generated_test_code)
             print("\n" + "="*80 + "\n")
             
-        # --- NEW: Run full project verification after all tests are generated ---
+   
         print("\nInitiating full project test verification (mvn clean verify / gradle clean test)...")
         full_project_test_results = test_generator.java_test_runner.run_project_tests(is_full_verify=True)
         
@@ -1245,7 +1200,7 @@ if __name__ == "__main__":
         
         if full_project_test_results['status'] != "SUCCESS":
             print("\nWARNING: Full project verification FAILED or had ERRORS. Check logs above.")
-            # You might want to add more sophisticated error handling or logging here.
+           
         print("\n--- Full Project Test Verification Completed ---")
 
 
