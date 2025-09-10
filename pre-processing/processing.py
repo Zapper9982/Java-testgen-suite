@@ -3,6 +3,9 @@ import re
 import shutil
 from pathlib import Path
 
+from dotenv import load_dotenv
+load_dotenv()
+
 #config 
 SPRING_BOOT_PROJECT_ROOT_ENV = os.getenv("SPRING_BOOT_PROJECT_PATH")
 if not SPRING_BOOT_PROJECT_ROOT_ENV:

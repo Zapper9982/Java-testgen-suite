@@ -4,6 +4,9 @@ from pathlib import Path
 import json
 from typing import List, Dict, Any, Union
 
+from dotenv import load_dotenv
+load_dotenv()
+
 #imports
 TESTGEN_AUTOMATION_ROOT = Path(__file__).parent.parent.parent 
 SPRING_BOOT_PROJECT_ROOT = os.getenv("SPRING_BOOT_PROJECT_PATH")
