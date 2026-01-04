@@ -54,7 +54,7 @@ MAX_TEST_GENERATION_RETRIES = 15
 
 
 
-from analyzer.code_analysis_utils import extract_custom_imports_from_chunk_file, resolve_transitive_dependencies, resolve_dependency_path, build_global_class_map
+from analyzer.code_analysis_utils import extract_custom_imports_from_chunk_file, resolve_transitive_dependencies, resolve_dependency_path, build_global_class_map, extract_method_invocations_in_batch
 from test_runner.java_test_runner import JavaTestRunner 
 
 from chroma_db.chroma_client import get_chroma_client, get_or_create_collection
@@ -379,19 +379,9 @@ class TestCaseGenerator:
             main_code = f.read()
         main_code = strip_java_comments_and_trailing_whitespace(main_code)
         full_context += main_code + "\n--- END MAIN CLASS UNDER TEST ---\n\n"
+        # [REVERTED] Context building logic moved to inside batch loop for GraphRAG
         if test_type != "controller":
-            for dep in all_deps:
-                if dep == main_class_filename:
-                    continue
-                dep_path = resolve_dependency_path(dep, main_code, SPRING_BOOT_MAIN_JAVA_DIR)
-                print(f"[DEBUG] Dependency: {dep}, Resolved path: {dep_path}")
-                if dep_path and os.path.exists(dep_path):
-                    dep_signatures = extract_class_signatures(dep_path)
-                else:
-                    print(f"[WARNING] Could not find dependency file: {dep}")
-                    dep_signatures = f"// Dependency not found: {dep}"
-                dep_signatures = strip_java_comments_and_trailing_whitespace(dep_signatures)
-                full_context += f"--- BEGIN DEPENDENCY SIGNATURES: {dep} ---\n{dep_signatures}\n--- END DEPENDENCY SIGNATURES: {dep} ---\n\n"
+            pass 
   
         with open(target_info['java_file_path_abs'], 'r', encoding='utf-8') as f:
             main_class_code = f.read()
@@ -478,7 +468,11 @@ class TestCaseGenerator:
                 traceback.print_exc()
                 minimal_class_code = main_code 
 
-            referenced_types = extract_referenced_types(target_info['java_file_path_abs'], batch)
+            # GraphRAG: Use Bridge to find used types
+            print(f"[GraphRAG] Analyzing dependencies for batch {i+1}...")
+            usage_data = extract_method_invocations_in_batch(Path(target_info['java_file_path_abs']), batch)
+            referenced_types = list(usage_data.get("used_types", []))
+            print(f"[GraphRAG] Found used types: {referenced_types}")
             dep_signatures = []
             included_deps = []
             

@@ -9,6 +9,7 @@ import com.github.javaparser.ast.expr.ObjectCreationExpr;
 import com.github.javaparser.ast.expr.VariableDeclarationExpr;
 import com.github.javaparser.ast.expr.FieldAccessExpr;
 import com.github.javaparser.ast.expr.MethodCallExpr;
+import com.github.javaparser.ast.expr.Expression;
 import com.github.javaparser.ast.type.ClassOrInterfaceType;
 import com.github.javaparser.ast.type.Type;
 
@@ -39,7 +40,8 @@ public class JavaParserBridge {
             case "extract_methods":
                 Set<String> methods = new HashSet<>();
                 cu.findAll(MethodDeclaration.class).forEach(m -> {
-                    if (m.isPublic()) methods.add(m.getNameAsString());
+                    if (m.isPublic())
+                        methods.add(m.getNameAsString());
                 });
                 System.out.println(String.join(",", methods));
                 break;
@@ -54,7 +56,8 @@ public class JavaParserBridge {
                     }
                 }
                 if (!found) {
-                    System.err.println("[WARN] No top-level type matching " + targetName + " in " + filePath + ". Outputting all top-level types.");
+                    System.err.println("[WARN] No top-level type matching " + targetName + " in " + filePath
+                            + ". Outputting all top-level types.");
                     for (TypeDeclaration<?> type : cu.getTypes()) {
                         printTypeSignature(type);
                     }
@@ -84,15 +87,18 @@ public class JavaParserBridge {
                 while (!toVisit.isEmpty()) {
                     String m = toVisit.iterator().next();
                     toVisit.remove(m);
-                    if (!visited.add(m)) continue;
+                    if (!visited.add(m))
+                        continue;
                     MethodDeclaration md = methodMap.get(m);
-                    if (md == null) continue;
+                    if (md == null)
+                        continue;
                     md.accept(new VoidVisitorAdapter<Void>() {
                         @Override
                         public void visit(FieldAccessExpr n, Void arg) {
                             usedFields.add(n.getNameAsString());
                             super.visit(n, arg);
                         }
+
                         @Override
                         public void visit(MethodCallExpr n, Void arg) {
                             n.getScope().ifPresent(scope -> {
@@ -102,13 +108,15 @@ public class JavaParserBridge {
                                         toVisit.add(called);
                                     }
                                 } else if (scope.isNameExpr()) {
-                                    // This captures field references like: benCompleteMapper.benDetailForOutboundDTOToIBeneficiary()
+                                    // This captures field references like:
+                                    // benCompleteMapper.benDetailForOutboundDTOToIBeneficiary()
                                     String fieldName = scope.asNameExpr().getNameAsString();
                                     usedFields.add(fieldName);
                                 }
                             });
                             super.visit(n, arg);
                         }
+
                         @Override
                         public void visit(ClassOrInterfaceType n, Void arg) {
                             usedTypes.add(n.getNameAsString());
@@ -137,6 +145,125 @@ public class JavaParserBridge {
                     System.out.println("}");
                 });
                 break;
+            case "extract_invocations":
+                if (args.length < 3) {
+                    System.err.println("Usage: JavaParserBridge extract_invocations <file> method1,method2,...");
+                    System.exit(1);
+                }
+                Set<String> invBatchMethods = new HashSet<>(Arrays.asList(args[2].split(",")));
+                Set<String> invUsedFields = new HashSet<>();
+                Set<String> invUsedTypes = new HashSet<>();
+
+                Optional<ClassOrInterfaceDeclaration> invMainClassOpt = cu.findFirst(ClassOrInterfaceDeclaration.class);
+                if (!invMainClassOpt.isPresent()) {
+                    System.out.println("{\"used_fields\": [], \"used_types\": []}");
+                    break;
+                }
+                ClassOrInterfaceDeclaration invMainClass = invMainClassOpt.get();
+                Map<String, MethodDeclaration> invMethodMap = new HashMap<>();
+                for (MethodDeclaration md : invMainClass.getMethods()) {
+                    invMethodMap.put(md.getNameAsString(), md);
+                }
+
+                // Track field types maps: fieldName -> typeName
+                Map<String, String> fieldTypeMap = new HashMap<>();
+                for (FieldDeclaration fd : invMainClass.getFields()) {
+                    String typeName = fd.getCommonType().asString();
+                    for (VariableDeclarator vd : fd.getVariables()) {
+                        fieldTypeMap.put(vd.getNameAsString(), typeName);
+                    }
+                }
+
+                Set<String> invToVisit = new HashSet<>(invBatchMethods);
+                Set<String> invVisited = new HashSet<>();
+
+                while (!invToVisit.isEmpty()) {
+                    String m = invToVisit.iterator().next();
+                    invToVisit.remove(m);
+                    if (!invVisited.add(m))
+                        continue;
+
+                    MethodDeclaration md = invMethodMap.get(m);
+                    if (md == null)
+                        continue;
+
+                    md.accept(new VoidVisitorAdapter<Void>() {
+                        @Override
+                        public void visit(FieldAccessExpr n, Void arg) {
+                            invUsedFields.add(n.getNameAsString());
+                            super.visit(n, arg);
+                        }
+
+                        @Override
+                        public void visit(MethodCallExpr n, Void arg) {
+                            if (n.getScope().isPresent()) {
+                                Expression scope = n.getScope().get();
+                                if (scope.isThisExpr() || scope.isSuperExpr()) {
+                                    String called = n.getNameAsString();
+                                    if (invMethodMap.containsKey(called) && !invVisited.contains(called)) {
+                                        invToVisit.add(called);
+                                    }
+                                } else if (scope.isNameExpr()) {
+                                    String fieldName = scope.asNameExpr().getNameAsString();
+                                    invUsedFields.add(fieldName);
+                                }
+                            } else {
+                                // Implicit "this" scope (local method call)
+                                String called = n.getNameAsString();
+                                if (invMethodMap.containsKey(called) && !invVisited.contains(called)) {
+                                    invToVisit.add(called);
+                                }
+                            }
+                            super.visit(n, arg);
+                        }
+
+                        @Override
+                        public void visit(ClassOrInterfaceType n, Void arg) {
+                            invUsedTypes.add(n.getNameAsString());
+                            super.visit(n, arg);
+                        }
+
+                        // Also capture types in variable declarations inside methods (e.g. local vars)
+                        @Override
+                        public void visit(VariableDeclarationExpr n, Void arg) {
+                            invUsedTypes.add(n.getElementType().toString());
+                            super.visit(n, arg);
+                        }
+                    }, null);
+                }
+
+                // Resolve types for used fields
+                for (String fieldName : invUsedFields) {
+                    if (fieldTypeMap.containsKey(fieldName)) {
+                        invUsedTypes.add(fieldTypeMap.get(fieldName));
+                    }
+                }
+
+                // Manual JSON construction
+                StringBuilder jsonFields = new StringBuilder("[");
+                int fIdx = 0;
+                for (String f : invUsedFields) {
+                    jsonFields.append("\"").append(f).append("\"");
+                    if (fIdx < invUsedFields.size() - 1)
+                        jsonFields.append(", ");
+                    fIdx++;
+                }
+                jsonFields.append("]");
+
+                StringBuilder jsonTypes = new StringBuilder("[");
+                int tIdx = 0;
+                for (String t : invUsedTypes) {
+                    jsonTypes.append("\"").append(t).append("\"");
+                    if (tIdx < invUsedTypes.size() - 1)
+                        jsonTypes.append(", ");
+                    tIdx++;
+                }
+                jsonTypes.append("]");
+
+                System.out.println("{ \"used_fields\": " + jsonFields.toString() + ", \"used_types\": "
+                        + jsonTypes.toString() + " }");
+                break;
+
             case "extract_referenced_types":
                 if (args.length < 3) {
                     System.err.println("Usage: JavaParserBridge extract_referenced_types <file> method1,method2,...");
@@ -160,13 +287,18 @@ public class JavaParserBridge {
                 while (!toVisit2.isEmpty()) {
                     String m = toVisit2.iterator().next();
                     toVisit2.remove(m);
-                    if (!visited2.add(m)) continue;
+                    if (!visited2.add(m))
+                        continue;
                     MethodDeclaration md = methodMap2.get(m);
-                    if (md == null) continue;
+                    if (md == null)
+                        continue;
                     // Collect types from signature
-                    if (md.getType() != null) referencedTypes.add(md.getType().toString());
-                    for (Parameter p : md.getParameters()) referencedTypes.add(p.getType().toString());
-                    for (Type t : md.getThrownExceptions()) referencedTypes.add(t.toString());
+                    if (md.getType() != null)
+                        referencedTypes.add(md.getType().toString());
+                    for (Parameter p : md.getParameters())
+                        referencedTypes.add(p.getType().toString());
+                    for (Type t : md.getThrownExceptions())
+                        referencedTypes.add(t.toString());
                     // Collect types from body
                     md.accept(new VoidVisitorAdapter<Void>() {
                         @Override
@@ -174,16 +306,19 @@ public class JavaParserBridge {
                             referencedTypes.add(n.getType().toString());
                             super.visit(n, arg);
                         }
+
                         @Override
                         public void visit(VariableDeclarationExpr n, Void arg) {
                             referencedTypes.add(n.getElementType().toString());
                             super.visit(n, arg);
                         }
+
                         @Override
                         public void visit(FieldAccessExpr n, Void arg) {
                             referencedTypes.add(n.getScope().toString());
                             super.visit(n, arg);
                         }
+
                         @Override
                         public void visit(MethodCallExpr n, Void arg) {
                             n.getScope().ifPresent(scope -> {
@@ -196,6 +331,7 @@ public class JavaParserBridge {
                             });
                             super.visit(n, arg);
                         }
+
                         @Override
                         public void visit(ClassOrInterfaceType n, Void arg) {
                             referencedTypes.add(n.getNameAsString());
@@ -211,8 +347,8 @@ public class JavaParserBridge {
                 }
                 // Remove primitives and java.lang
                 Set<String> filtered = referencedTypes.stream()
-                    .filter(t -> !t.matches("int|long|double|float|boolean|char|byte|short|void|String"))
-                    .collect(Collectors.toSet());
+                        .filter(t -> !t.matches("int|long|double|float|boolean|char|byte|short|void|String"))
+                        .collect(Collectors.toSet());
                 System.out.println(String.join(",", filtered));
                 break;
             default:
@@ -227,7 +363,8 @@ public class JavaParserBridge {
             if (cls.isInterface()) {
                 // Handle interface signature
                 StringBuilder sb = new StringBuilder();
-                if (cls.isPublic()) sb.append("public ");
+                if (cls.isPublic())
+                    sb.append("public ");
                 sb.append("interface ").append(cls.getNameAsString());
                 if (cls.getExtendedTypes().size() > 0) {
                     sb.append(" extends ");
@@ -238,10 +375,12 @@ public class JavaParserBridge {
                 // Print method signatures
                 for (MethodDeclaration method : cls.getMethods()) {
                     StringBuilder msig = new StringBuilder();
-                    if (method.isPublic()) msig.append("    public ");
+                    if (method.isPublic())
+                        msig.append("    public ");
                     msig.append(method.getType().toString()).append(" ");
                     msig.append(method.getNameAsString()).append("(");
-                    msig.append(method.getParameters().stream().map(Object::toString).collect(Collectors.joining(", ")));
+                    msig.append(
+                            method.getParameters().stream().map(Object::toString).collect(Collectors.joining(", ")));
                     msig.append(");");
                     System.out.println(msig.toString());
                 }
@@ -275,9 +414,12 @@ public class JavaParserBridge {
 
     private static String getClassSignature(ClassOrInterfaceDeclaration cls) {
         StringBuilder sb = new StringBuilder();
-        if (cls.isPublic()) sb.append("public ");
-        if (cls.isInterface()) sb.append("interface ");
-        else sb.append("class ");
+        if (cls.isPublic())
+            sb.append("public ");
+        if (cls.isInterface())
+            sb.append("interface ");
+        else
+            sb.append("class ");
         sb.append(cls.getNameAsString());
         if (cls.getExtendedTypes().size() > 0) {
             sb.append(" extends ");
@@ -292,9 +434,12 @@ public class JavaParserBridge {
 
     private static String getMethodSignature(MethodDeclaration method) {
         StringBuilder sb = new StringBuilder();
-        if (method.isPublic()) sb.append("public ");
-        if (method.isProtected()) sb.append("protected ");
-        if (method.isStatic()) sb.append("static ");
+        if (method.isPublic())
+            sb.append("public ");
+        if (method.isProtected())
+            sb.append("protected ");
+        if (method.isStatic())
+            sb.append("static ");
         sb.append(method.getType().toString()).append(" ");
         sb.append(method.getNameAsString()).append("(");
         sb.append(method.getParameters().stream().map(Object::toString).collect(Collectors.joining(", ")));
@@ -304,8 +449,10 @@ public class JavaParserBridge {
 
     private static String getConstructorSignature(ConstructorDeclaration ctor) {
         StringBuilder sb = new StringBuilder();
-        if (ctor.isPublic()) sb.append("public ");
-        if (ctor.isProtected()) sb.append("protected ");
+        if (ctor.isPublic())
+            sb.append("public ");
+        if (ctor.isProtected())
+            sb.append("protected ");
         sb.append(ctor.getNameAsString()).append("(");
         sb.append(ctor.getParameters().stream().map(Object::toString).collect(Collectors.joining(", ")));
         sb.append(")");

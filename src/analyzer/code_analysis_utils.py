@@ -2,6 +2,8 @@ import re
 from pathlib import Path
 from typing import List, Dict, Any, Union, Optional
 import re, os
+import subprocess
+import json
 
 # This file (code_analysis_utils.py) is a utility module within the 'analyzer' package.
 # It does not define root paths; those are passed from the calling scripts.
@@ -202,6 +204,67 @@ class SpringBootAnalyser:
         print(f"Finished scanning. Discovered {len(discovered_targets)} Spring Boot targets (Services/Controllers).")
         return discovered_targets
 
+# Assuming TESTGEN_AUTOMATION_ROOT is available from context or import, 
+# otherwise we derive it roughly or expect it passed.
+# Since this is a util, we'll assume the caller sets up paths, 
+# but for the bridge call we need the bridge path.
+# We'll rely on relative paths from this file.
+
+current_file_path = Path(__file__).resolve()
+# src/analyzer/code_analysis_utils.py -> src/analyzer -> src -> root
+PROJECT_ROOT = current_file_path.parent.parent.parent
+JAVABRIDGE_DIR = PROJECT_ROOT / "javabridge"
+JAVAPARSER_JAR = PROJECT_ROOT / "lib" / "javaparser-core-3.25.4.jar"
+
+def extract_method_invocations_in_batch(file_path: Path, method_names: List[str]) -> Dict[str, Set[str]]:
+    """
+    Calls JavaParserBridge to extract used fields and types for a batch of methods.
+    Returns a dict with 'used_fields' and 'used_types'.
+    """
+    cmd = [
+        "java",
+        "-cp",
+        f".:{str(JAVAPARSER_JAR)}", # Unix separator. PROJECT_ROOT is pwd, so . includes javabridge package dir
+        "javabridge.JavaParserBridge",
+        "extract_invocations",
+        str(file_path),
+        ",".join(method_names)
+    ]
+    
+    try:
+        # Run subprocess from the PROJECT_ROOT directory to support package structure
+        result = subprocess.run(
+            cmd,
+            cwd=str(PROJECT_ROOT), 
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        
+        output = result.stdout.strip()
+        # The bridge prints JSON.
+        data = json.loads(output)
+        
+        return {
+            "used_fields": set(data.get("used_fields", [])),
+            "used_types": set(data.get("used_types", []))
+        }
+        
+    except subprocess.CalledProcessError as e:
+        print(f"[ERROR] JavaParserBridge failed: {e.stderr}")
+        return {"used_fields": set(), "used_types": set()}
+    except json.JSONDecodeError as e:
+        print(f"[ERROR] Failed to parse JSON from JavaParserBridge: {e}. Output: {output}")
+        return {"used_fields": set(), "used_types": set()}
+    except Exception as e:
+        print(f"[ERROR] Unexpected error in extract_method_invocations_in_batch: {e}")
+        return {"used_fields": set(), "used_types": set()}
+
+def resolve_field_types(file_path: Path, field_names: set) -> Dict[str, str]:
+    # This is now largely redundant as the bridge returns types directly, 
+    # but we keep the signature for compatibility or if we need specific mapping logic later.
+    # For now, we rely on the bridge's "used_types" which gives us the class names directly.
+    return {} 
 def resolve_transitive_dependencies(java_file_path: Path, project_main_java_dir: Path) -> List[str]:
     """
     Recursively resolve all transitive dependencies (filenames) for a given Java file.
@@ -228,7 +291,7 @@ def resolve_transitive_dependencies(java_file_path: Path, project_main_java_dir:
                 break
             if dep_path and dep_path not in visited:
                 to_visit.append(dep_path)
-    return sorted(all_filenames)
+    return sorted(list(all_filenames))
 
 
 def build_global_class_map(project_root):
